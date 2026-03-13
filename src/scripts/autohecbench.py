@@ -35,8 +35,7 @@ class Benchmark:
             self.base_name = name
         
         logging.debug(f"Benchmark: {self.name}, base: {self.base_name}")
-        
-        if name.endswith('sycl'):
+        if 'sycl' in name or name.endswith('sycl'):
             logging.info(f"Type of SYCL device to use: {args.sycl_type}")
             self.MAKE_ARGS = ['GCC_TOOLCHAIN="{}"'.format(args.gcc_toolchain)]
             if args.sycl_type == 'cuda':
@@ -52,9 +51,9 @@ class Benchmark:
                 self.MAKE_ARGS.append('CUDA=no')
                 self.MAKE_ARGS.append('HIP=no')
                 self.MAKE_ARGS.append('GPU=no')
-        elif name.endswith('cuda'):
+        elif 'cuda' in name or name.endswith('cuda'):
             self.MAKE_ARGS = ['ARCH=sm_{}'.format(args.nvidia_sm)]
-        elif name.endswith('omp'):
+        elif 'omp' in name or name.endswith('omp'):
             # a simple way to select one of the Makefiles
             self.MAKE_ARGS = ['-f']
             if "nvc" in args.compiler_name:
@@ -96,7 +95,7 @@ class Benchmark:
         out = subprocess.DEVNULL
         if self.verbose:
             out = subprocess.PIPE
-
+        print(self.MAKE_ARGS)
         proc = subprocess.run(["make"] + self.MAKE_ARGS, cwd=self.path,
                               stdout=out, stderr=subprocess.STDOUT, encoding="utf-8")
 
