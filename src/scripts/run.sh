@@ -32,3 +32,25 @@ TMPDIR=/mnt/disk3/yusheng/tmp_ncu XDG_RUNTIME_DIR=/mnt/disk3/yusheng/tmp_ncu ncu
 
 python3 extract_reports.py --reports reports/ncu --set basic --out ncu_reports_summary.csv --metrics "Achieved Occupancy,Compute (SM) Throughput,DRAM Throughput,Memory Throughput"
 
+
+## i want vtune
+
+./autohecbench.py backprop-sycl --sycl-type cpu --compiler-name icpx --yes-prompt
+
+# make GCC_TOOLCHAIN="" CUDA=no HIP=no GPU=no CC=icpx
+# ./main [run-args]
+# 
+
+# ../backprop-sycl/main 4096
+
+# vtune -collect hotspots -app-working-dir /path/to/app -result-dir ./results -- ./app
+# vtune -collect threading -app-working-dir /home/user/app -result-dir ./threading_results -- ./app --arg1 --arg2
+
+# vtune -collect hotspots -result-dir ./matrix_results -- ./matrix_multiply
+# vtune -collect threading -result-dir ./web_server_results -- ./web_server
+
+# bypass ptrace_scope
+# echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+vtune -collect hotspots -result-dir ./vtune_results -- ../backprop-sycl/main 4096
+
+vtune -collect uarch-exploration -result-dir ./vtune_results -- ../backprop-sycl/main 4096
