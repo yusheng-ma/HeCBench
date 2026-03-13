@@ -1,0 +1,27 @@
+*~
+*.bin
+*.o
+*.ppm
+*.csv
+*.bak
+*.traindata
+*.swp
+*.out
+*.log
+*.yaml
+dpct_output
+*/main
+main
+*.tmp
+
+# Exclude text files except CMake and documentation
+*.txt
+!CMakeLists.txt
+!plan.md
+!README*.md
+!*.markdown
+
+# Exclude JSON files except CMake presets
+*.json
+!CMakePresets.json
+!CMakeUserPresets.json

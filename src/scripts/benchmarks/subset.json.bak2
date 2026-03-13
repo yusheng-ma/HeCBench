@@ -1,0 +1,37 @@
+{
+    "floydwarshall": [
+        "(?:Average kernel execution time )([0-9.+-e]+)(?: \\(s\\))",
+        [
+            "1024",
+            "100",
+            "16"
+        ]
+    ],
+    "backprop": [
+        "(?:Device offloading time = )([0-9.+-e]+)(?:\\(s\\))",
+        [
+            "65536"
+        ]
+    ],
+    "convolution3D": [
+        "(?:Average kernel execution time of conv3d_s3 kernel: )([0-9.+-e]+)(?: \\(us\\))",
+        [
+            "32","6","16","14","14","5","100"
+        ]
+    ],
+    "crossEntropy": [
+        "(?:Average GPU kernel time \\(ms\\) : )([0-9.+-e]+)",
+        [
+            "100"
+        ]
+    ],
+    "softmax": [
+        "(?:Average kernel execution time: )([0-9.+-e]+)(?: \\(ms\\))",
+        [
+            "100000",
+            "784",
+            "0",
+            "100"
+        ]
+    ]
+}
