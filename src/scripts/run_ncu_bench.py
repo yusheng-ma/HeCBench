@@ -2,54 +2,44 @@
 """
 Runner to profile a benchmark family defined in benchmarks/subset.json using ncu.
 
-Updates requested:
-- By default do NOT pass --metrics to ncu (some ncu versions/devices don't support the metric names).
-  Use --use-metrics to explicitly enable passing a metrics list.
-- If a requested metric (like "sm_efficiency") is not present, try to derive it from CSV metrics
-  (e.g. map "sm_efficiency" -> "Compute (SM) Throughput" when available).
-- Use the CSV "Duration" metric (ns) as ncu_time_s (converted to seconds). Keep the wallclock
-  elapsed as ncu_time_s_wallclock for reference.
-- When writing summary, prefer the original CSV metric name for the column header when we matched
-  a requested metric to a CSV metric (so the summary uses the CSV's canonical metric labels).
-- Build summary CSV fieldnames as the union of keys across all rows (so different runs with
-  different available metrics are handled).
-- Keep previous behavior: per-testcase CSV under --ncu-out/<set>/<bench>/<benchname>/<benchname>.csv,
-  optional --keep-logs, automatic cleaning of preamble before the CSV header, retries on missing metrics.
+This updated script reads benchmarks the same way as the HeCBench runner:
+- Accepts positional --bench arguments which can be backend groups ('cuda','hip','sycl')
+  or specific benchmark names (optionally including backend and parameter suffixes).
+- Supports benchmarks with multiple parameter sets in subset.json.
+- Creates per-testcase output under --ncu-out/<set>/<bench>/<benchname>/<benchname>.csv
+- Default: do NOT pass --metrics to ncu (use --use-metrics to enable).
+- If requested metric name not present in CSV, script will try to match a CSV metric
+  (heuristics for sm_efficiency/occupancy).
+- Uses CSV Duration (ns) as ncu_time_s (seconds). Also keeps wallclock ncu_time_s_wallclock.
+- Cleans CSV preamble, removes empty logs, retries on missing metrics when --use-metrics used.
 
-Usage example (no metrics passed to ncu):
+Usage example (no --metrics passed to ncu):
 TMPDIR=/mnt/disk3/yusheng/tmp_ncu XDG_RUNTIME_DIR=/mnt/disk3/yusheng/tmp_ncu \
 ./run_ncu_bench.py --bench floydwarshall --bench-dir /mnt/disk3/yusheng/HeCBench/src \
   --ncu-binary ncu --ncu-set basic --launch-skip 0 --launch-count 1 \
   --ncu-out reports/ncu --metrics "sm_efficiency,achieved_occupancy" --keep-logs
-
-To force ncu to be invoked with --metrics (if you want and your version supports them):
-add the flag --use-metrics.
 """
+from __future__ import annotations
 import os
+import sys
 import json
-import subprocess
-import argparse
-import csv
 import time
 import shlex
+import csv
 import re
+import argparse
+import subprocess
 from collections import defaultdict
+from typing import List, Tuple
 
-def safe_mkdir(path):
+# -----------------------
+# utility helpers
+# -----------------------
+def safe_mkdir(path: str):
     if not os.path.isdir(path):
         os.makedirs(path, exist_ok=True)
 
-def load_entry(subset_json, bench_base):
-    with open(subset_json) as f:
-        d = json.load(f)
-    if bench_base not in d:
-        raise KeyError(f"{bench_base} not found in {subset_json}")
-    entry = d[bench_base]
-    res_regex = entry[0]
-    param_list = entry[1] if len(entry) > 1 else []
-    return res_regex, param_list
-
-def detect_csv_delimiter_and_header(path):
+def detect_csv_delimiter_and_header(path: str):
     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
         sample = ''
         for _ in range(50):
@@ -61,19 +51,22 @@ def detect_csv_delimiter_and_header(path):
                 break
         if not sample:
             return ',', None
-        sniffer = csv.Sniffer()
         try:
+            sniffer = csv.Sniffer()
             dialect = sniffer.sniff(sample)
             delim = dialect.delimiter
         except Exception:
             delim = ','
-        header_line = sample
-    return delim, header_line
+    return delim, sample
 
-def clean_csv_if_needed(csv_path):
+def clean_csv_if_needed(csv_path: str) -> bool:
+    """Trim any profiler preamble and duplicate CSV headers; return True if header found."""
     header_re = re.compile(r'^\s*"ID"\s*,\s*"Process ID"', re.IGNORECASE)
-    with open(csv_path, 'r', encoding='utf-8', errors='ignore') as f:
-        lines = f.readlines()
+    try:
+        with open(csv_path, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+    except Exception:
+        return False
 
     header_idx = None
     for i, L in enumerate(lines):
@@ -91,18 +84,18 @@ def clean_csv_if_needed(csv_path):
                 cleaned.append(L)
                 seen_header = True
             else:
+                # skip duplicate header
                 continue
         else:
             cleaned.append(L)
-
-    with open(csv_path, 'w', encoding='utf-8', errors='ignore') as f:
-        f.writelines(cleaned)
+    try:
+        with open(csv_path, 'w', encoding='utf-8', errors='ignore') as f:
+            f.writelines(cleaned)
+    except Exception:
+        return False
     return True
 
-def parse_csv_rows(csv_path):
-    """
-    Read CSV rows (skipping comment lines) and return header list and row dicts.
-    """
+def parse_csv_rows(csv_path: str):
     if not os.path.isfile(csv_path):
         raise FileNotFoundError(csv_path)
     delim, _ = detect_csv_delimiter_and_header(csv_path)
@@ -121,14 +114,8 @@ def parse_csv_rows(csv_path):
     return header, rows
 
 def extract_metric_values(rows):
-    """
-    From parsed CSV rows, build a mapping metric_name -> list of numeric values.
-    Handles 'Metric Name' and 'Metric Value' columns (case-insensitive search).
-    Cleans numeric strings (removes commas and percent signs).
-    """
     if not rows:
         return {}
-
     sample_keys = list(rows[0].keys())
     metric_col = None
     value_col = None
@@ -139,7 +126,6 @@ def extract_metric_values(rows):
         if 'metric value' == kl or kl == 'metricvalue' or 'metric value' in kl:
             value_col = k
     if metric_col is None or value_col is None:
-        # fallback to common names
         if 'Metric Name' in rows[0]:
             metric_col = 'Metric Name'
         if 'Metric Value' in rows[0]:
@@ -189,39 +175,69 @@ def aggregate_metric_map(metric_map, agg='mean'):
             agg_map[k] = sum(vals) / len(vals)
     return agg_map
 
-def find_bench_dir(script_dir, bench_base, backend=None, bench_dir_arg=None):
-    candidates = []
-    if bench_dir_arg:
-        root = os.path.realpath(bench_dir_arg)
-        if backend:
-            candidates.append(os.path.join(root, f"{bench_base}-{backend}"))
-        candidates.append(os.path.join(root, bench_base))
-        try:
-            for name in os.listdir(root):
-                if name.startswith(bench_base):
-                    candidates.append(os.path.join(root, name))
-        except FileNotFoundError:
-            pass
-    parent = os.path.realpath(os.path.join(script_dir, '..'))
-    if backend:
-        candidates.append(os.path.join(parent, f"{bench_base}-{backend}"))
-    candidates.append(os.path.join(parent, bench_base))
+def remove_empty_file(path: str) -> bool:
     try:
-        for name in os.listdir(parent):
-            if name.startswith(bench_base):
-                candidates.append(os.path.join(parent, name))
-    except FileNotFoundError:
+        if os.path.isfile(path) and os.path.getsize(path) == 0:
+            os.remove(path)
+            return True
+    except Exception:
         pass
-    for c in candidates:
-        if os.path.isdir(c):
-            return c
-    cwd = os.getcwd()
-    for name in os.listdir(cwd):
-        if name.startswith(bench_base) and os.path.isdir(os.path.join(cwd, name)):
-            return os.path.join(cwd, name)
-    raise FileNotFoundError("Benchmark path not found for base '{}'. Tried: {}".format(bench_base, ", ".join(candidates)))
+    return False
 
-def run_ncu_to_files(cmd, cwd, csv_path, log_path, timeout, env):
+def extract_offending_metric_from_text(text: str):
+    if not text:
+        return None
+    m = re.search(r'Failed to find metric regex:\^([A-Za-z0-9_]+)\.', text)
+    if m:
+        return m.group(1)
+    m2 = re.search(r'Failed to find metric regex:.*?([A-Za-z0-9_]+)\\?\.', text)
+    if m2:
+        return m2.group(1)
+    m3 = re.search(r'Failed to find metric.*?([A-Za-z0-9_]+)', text)
+    if m3:
+        return m3.group(1)
+    return None
+
+def find_best_match_for_requested(requested_normalized: str, metric_keys: List[str]):
+    for k in metric_keys:
+        kn = re.sub(r'[^a-z0-9]', '', k.lower())
+        if kn == requested_normalized:
+            return k
+    for k in metric_keys:
+        kn = re.sub(r'[^a-z0-9]', '', k.lower())
+        if requested_normalized in kn:
+            return k
+    if 'sm' in requested_normalized or 'smeff' in requested_normalized or 'smefficiency' in requested_normalized:
+        for k in metric_keys:
+            kl = k.lower()
+            if 'compute' in kl and 'sm' in kl:
+                return k
+            if 'compute' in kl and 'throughput' in kl:
+                return k
+            if 'sm efficiency' in kl or 'sm_efficiency' in kl:
+                return k
+    if 'occup' in requested_normalized:
+        for k in metric_keys:
+            if 'occup' in k.lower():
+                return k
+    return None
+
+def choose_csv_from_dir(bench_out_dir: str, bench_name: str):
+    candidate = os.path.join(bench_out_dir, bench_name + ".csv")
+    if os.path.isfile(candidate):
+        return candidate
+    alt = os.path.join(bench_out_dir, bench_name + "-0.csv")
+    if os.path.isfile(alt):
+        return alt
+    for fn in os.listdir(bench_out_dir):
+        if fn.startswith(bench_name) and fn.endswith('.csv'):
+            return os.path.join(bench_out_dir, fn)
+    return None
+
+# -----------------------
+# ncu invocation helper
+# -----------------------
+def run_ncu_to_files(cmd: List[str], cwd: str, csv_path: str, log_path: str, timeout: int, env: dict):
     safe_mkdir(os.path.dirname(csv_path))
     safe_mkdir(os.path.dirname(log_path))
     start = time.time()
@@ -238,104 +254,135 @@ def run_ncu_to_files(cmd, cwd, csv_path, log_path, timeout, env):
     elapsed = time.time() - start
     return proc.returncode, elapsed
 
-def choose_csv_from_dir(bench_out_dir, bench_name):
-    candidate = os.path.join(bench_out_dir, bench_name + ".csv")
-    if os.path.isfile(candidate):
-        return candidate
-    alt = os.path.join(bench_out_dir, bench_name + "-0.csv")
-    if os.path.isfile(alt):
-        return alt
-    for fn in os.listdir(bench_out_dir):
-        if fn.startswith(bench_name) and fn.endswith('.csv'):
-            return os.path.join(bench_out_dir, fn)
-    return None
+# -----------------------
+# subset.json -> bench list construction
+# -----------------------
+def load_subset_json(path: str):
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
-def remove_empty_file(path):
-    try:
-        if os.path.isfile(path) and os.path.getsize(path) == 0:
-            os.remove(path)
-            return True
-    except Exception:
-        pass
-    return False
+def load_fails(path: str) -> List[str]:
+    if not os.path.isfile(path):
+        return []
+    with open(path, 'r', encoding='utf-8') as f:
+        return [l.strip() for l in f if l.strip()]
 
-def extract_offending_metric_from_text(text):
-    if not text:
-        return None
-    m = re.search(r'Failed to find metric regex:\^([A-Za-z0-9_]+)\.', text)
-    if m:
-        return m.group(1)
-    m2 = re.search(r'Failed to find metric regex:.*?([A-Za-z0-9_]+)\\?\.', text)
-    if m2:
-        return m2.group(1)
-    m3 = re.search(r'Failed to find metric.*?([A-Za-z0-9_]+)', text)
-    if m3:
-        return m3.group(1)
-    return None
-
-def find_best_match_for_requested(requested_normalized, metric_keys):
+def build_bench_list(requested: List[str], benchmarks: dict, fails: List[str]) -> List[Tuple[str, str, List[str]]]:
     """
-    Find the best metric key from metric_keys that matches the normalized requested token.
-    Returns the matched metric key or None.
+    Returns list of tuples:
+      (bench_name, bench_dir_name, param_set)
+    bench_name is unique output name (may include param suffix).
+    bench_dir_name is the directory name under src (e.g., 'floydwarshall-cuda').
+    param_set is list of runtime args (may be []).
     """
-    # exact normalized match
-    for k in metric_keys:
-        kn = re.sub(r'[^a-z0-9]', '', k.lower())
-        if kn == requested_normalized:
-            return k
-    # substring match
-    for k in metric_keys:
-        kn = re.sub(r'[^a-z0-9]', '', k.lower())
-        if requested_normalized in kn:
-            return k
-    # Some heuristic mappings for sm_efficiency -> look for compute/sm throughput metrics
-    if 'sm' in requested_normalized or 'smeff' in requested_normalized or 'smefficiency' in requested_normalized:
-        for k in metric_keys:
-            kl = k.lower()
-            if 'compute' in kl and 'sm' in kl:
-                return k
-            if 'compute' in kl and 'throughput' in kl:
-                return k
-            if 'sm efficiency' in kl or 'sm_efficiency' in kl or 'sm efficiency' in kl:
-                return k
-    # occupancy -> Achieved Occupancy
-    if 'occup' in requested_normalized:
-        for k in metric_keys:
-            if 'occup' in k.lower():
-                return k
-    return None
+    benches = []
+    for r in requested:
+        if r in ['sycl', 'cuda', 'hip']:
+            backend = r
+            for k, v in benchmarks.items():
+                bench_dir_name = f"{k}-{backend}"
+                if bench_dir_name in fails:
+                    continue
+                res_regex = v[0]
+                run_args_list = v[1] if len(v) > 1 else []
+                if run_args_list and isinstance(run_args_list[0], list):
+                    for param_set in run_args_list:
+                        key = '_'.join(str(x) for x in param_set[:3])
+                        bench_name = f"{bench_dir_name}-{key}"
+                        benches.append((bench_name, bench_dir_name, param_set, res_regex))
+                else:
+                    bench_name = bench_dir_name
+                    benches.append((bench_name, bench_dir_name, run_args_list, res_regex))
+        else:
+            # specific benchmark requested; may include backend and params.
+            found = False
+            for k, v in benchmarks.items():
+                if r == k:
+                    # user provided just base name - ambiguous: pick default backend? skip
+                    continue
+                if r.startswith(k + '-'):
+                    suffix = r[len(k)+1:]
+                    parts = suffix.split('-')
+                    backend = parts[0]
+                    bench_dir_name = f"{k}-{backend}"
+                    if bench_dir_name in fails:
+                        found = True
+                        break
+                    res_regex = v[0]
+                    run_args_list = v[1] if len(v) > 1 else []
+                    if run_args_list and isinstance(run_args_list[0], list):
+                        # suffix may include param suffix after backend
+                        if len(parts) > 1:
+                            params = '-'.join(parts[1:])
+                            for param_set in run_args_list:
+                                expected_params = '_'.join(str(p) for p in param_set[:3])
+                                if expected_params == params:
+                                    bench_name = f"{bench_dir_name}-{params}"
+                                    benches.append((bench_name, bench_dir_name, param_set, res_regex))
+                                    found = True
+                                    break
+                        else:
+                            # no param suffix -> take first param set
+                            param_set = run_args_list[0]
+                            key = '_'.join(str(x) for x in param_set[:3])
+                            bench_name = f"{bench_dir_name}-{key}"
+                            benches.append((bench_name, bench_dir_name, param_set, res_regex))
+                            found = True
+                    else:
+                        # simple single-arg run
+                        benches.append((r, bench_dir_name, run_args_list, res_regex))
+                        found = True
+                    break
+            if not found:
+                raise ValueError(f"Unknown benchmark or malformed name: {r}")
+    return benches
 
+# -----------------------
+# main
+# -----------------------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--bench', default='convolution3D')
-    parser.add_argument('--backend', choices=['cuda','hip','sycl','omp'], default='cuda')
-    parser.add_argument('--subset-json', default=os.path.join('benchmarks','subset.json'))
-    parser.add_argument('--bench-dir', default=None)
+    parser = argparse.ArgumentParser(description='run_ncu_bench (HeCBench-style subset.json runner + ncu)')
+    parser.add_argument('--bench', '-B', nargs='+', required=True,
+                        help='Either backend group (sycl/cuda/hip) or specific benchmark name(s) (can include backend and param suffix)')
+    parser.add_argument('--subset-json', default=os.path.join('benchmarks','subset.json'),
+                        help='Path to subset.json')
+    parser.add_argument('--bench-dir', default=None, help='Root dir containing bench folders (e.g., /path/to/HeCBench/src)')
+    parser.add_argument('--bench-fails', default=os.path.join('benchmarks','subset-fails.txt'),
+                        help='File listing bench names to skip (one per line)')
+    parser.add_argument('--ncu-binary', default='ncu')
     parser.add_argument('--ncu-set', default='basic')
     parser.add_argument('--metrics', default='sm_efficiency,achieved_occupancy,inst_executed,dram_read_throughput,flop_count_sp')
     parser.add_argument('--use-metrics', action='store_true', help='Pass --metrics to ncu (disabled by default)')
+    parser.add_argument('--ncu-args', default='', help='Extra args to pass to ncu')
     parser.add_argument('--ncu-out', default='reports/ncu')
-    parser.add_argument('--summary', default='ncu_summary.csv')
     parser.add_argument('--timeout', type=int, default=1800)
-    parser.add_argument('--ncu-binary', default='ncu')
-    parser.add_argument('--ncu-args', default='')
     parser.add_argument('--tmpdir', default='/mnt/disk3/yusheng/tmp_ncu')
     parser.add_argument('--launch-skip', type=int, default=0)
     parser.add_argument('--launch-count', type=int, default=1)
-    parser.add_argument('--keep-logs', action='store_true', help='Keep .ncu.log files even if empty (useful for debugging)')
+    parser.add_argument('--keep-logs', action='store_true', help='Keep .ncu.log files even if empty')
+    parser.add_argument('--summary', default='ncu_summary.csv', help='Path to summary CSV to write')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-
     subset_json = args.subset_json
     if not os.path.isabs(subset_json):
         subset_json = os.path.join(script_dir, subset_json)
+    if not os.path.isfile(subset_json):
+        print("subset.json not found at", subset_json, file=sys.stderr)
+        sys.exit(1)
 
-    res_regex, param_list = load_entry(subset_json, args.bench)
+    benchmarks = load_subset_json(subset_json)
+    fails = load_fails(args.bench_fails if os.path.isabs(args.bench_fails) else os.path.join(script_dir, args.bench_fails))
 
-    out_dir = os.path.join(args.ncu_out, args.ncu_set, args.bench)
+    # build bench list
+    try:
+        benches = build_bench_list(args.bench, benchmarks, fails)
+    except Exception as e:
+        print("Failed to build benchmark list:", e, file=sys.stderr)
+        sys.exit(1)
+
+    out_dir = os.path.join(args.ncu_out, args.ncu_set)
     safe_mkdir(out_dir)
-
     default_tmp = os.path.expanduser(args.tmpdir)
     safe_mkdir(default_tmp)
     try:
@@ -343,41 +390,36 @@ def main():
     except Exception:
         pass
 
-    benches = []
-    for p in param_list:
-        key = "_".join(str(x) for x in p[:3])
-        bench_name = f"{args.bench}-{key}"
-        benches.append( (bench_name, p) )
+    extra_args = shlex.split(args.ncu_args) if args.ncu_args else []
+    requested_metrics = [m.strip() for m in args.metrics.split(',') if m.strip()]
 
     summary_rows = []
-    for bench_name, param_set in benches:
+
+    for bench_name, bench_dir_name, param_set, res_regex in benches:
         print("="*80)
         print("Profiling:", bench_name, "params:", param_set)
-        bench_path = None
+        # locate bench path
         if args.bench_dir:
-            candidate = os.path.join(os.path.realpath(args.bench_dir), f"{args.bench}-{args.backend}")
-            if os.path.isdir(candidate):
-                bench_path = candidate
-        if not bench_path:
-            try:
-                bench_path = find_bench_dir(script_dir, args.bench, backend=args.backend, bench_dir_arg=args.bench_dir)
-            except FileNotFoundError as e:
-                print("Benchmark path not found:", e)
-                continue
+            bench_path = os.path.realpath(os.path.join(args.bench_dir, bench_dir_name))
+        else:
+            bench_path = os.path.realpath(os.path.join(script_dir, '..', bench_dir_name))
+        if not os.path.isdir(bench_path):
+            print("Benchmark path not found:", bench_path, " skipping.", file=sys.stderr)
+            continue
         print("Using benchmark path:", bench_path)
 
-        bench_out_dir = os.path.join(out_dir, bench_name)
+        bench_out_dir = os.path.join(out_dir, bench_dir_name, bench_name)
         safe_mkdir(bench_out_dir)
 
         exec_path = os.path.join(bench_path, 'main')
         if not os.path.isfile(exec_path):
-            print("Executable not found:", exec_path)
+            print("Executable not found:", exec_path, " skipping.", file=sys.stderr)
             continue
         if not os.access(exec_path, os.X_OK):
             try:
                 os.chmod(exec_path, os.stat(exec_path).st_mode | 0o111)
             except Exception as e:
-                print("Failed to set executable bit:", e)
+                print("Failed to set executable bit:", e, file=sys.stderr)
                 continue
 
         per_tmp = os.path.join(default_tmp, bench_name)
@@ -386,23 +428,19 @@ def main():
             os.chmod(per_tmp, 0o700)
         except Exception:
             pass
-
         env = os.environ.copy()
         env['TMPDIR'] = per_tmp
         env['XDG_RUNTIME_DIR'] = per_tmp
 
-        # Use metrics only if explicitly requested
-        current_metrics = [m.strip() for m in args.metrics.split(',') if m.strip()] if args.use_metrics else []
-        extra_args = shlex.split(args.ncu_args) if args.ncu_args else []
-
-        csv_path = os.path.join(bench_out_dir, bench_name + ".csv")
-        log_path = os.path.join(bench_out_dir, bench_name + ".ncu.log")
-
-        # If metrics are requested (use-metrics) we still handle offending-metric removal logic
+        # prepare command
+        current_metrics = requested_metrics.copy() if args.use_metrics else []
         max_metric_retries = max(1, len(current_metrics) + 1)
         attempt_num = 0
         succeeded = False
         run_elapsed = None
+
+        csv_path = os.path.join(bench_out_dir, bench_name + ".csv")
+        log_path = os.path.join(bench_out_dir, bench_name + ".ncu.log")
 
         while attempt_num < max_metric_retries and not succeeded:
             attempt_num += 1
@@ -417,12 +455,12 @@ def main():
                 cmd += extra_args
             cmd += ['--', exec_path] + [str(x) for x in param_set]
 
-            print(f"[attempt {attempt_num}/{max_metric_retries}] running: {' '.join(shlex.quote(c) for c in cmd)}")
+            print(f"[attempt {attempt_num}/{max_metric_retries}] {' '.join(shlex.quote(c) for c in cmd)}")
             rc, elapsed = run_ncu_to_files(cmd, cwd=bench_out_dir, csv_path=csv_path, log_path=log_path, timeout=args.timeout, env=env)
             run_elapsed = elapsed
             print(f"ncu rc={rc} elapsed={elapsed:.1f}s")
 
-            # read both log and csv text (if exist)
+            # read both log and csv text
             log_text = ''
             csv_text = ''
             try:
@@ -458,7 +496,6 @@ def main():
                     print("ncu/log indicates profiling failure or application error; not retrying further.")
                     break
 
-            # If csv exists, attempt to clean (strip preamble) and accept if successful
             if os.path.isfile(csv_path):
                 ok = clean_csv_if_needed(csv_path)
                 if ok:
@@ -489,26 +526,25 @@ def main():
                 remove_empty_file(log_path)
             continue
 
-        # parse CSV rows and extract per-metric aggregates
+        # parse CSV and aggregate
         try:
             header, rows = parse_csv_rows(csv_path)
             metric_map = extract_metric_values(rows)
             metric_agg = aggregate_metric_map(metric_map, agg='mean')
         except Exception as e:
-            print("Failed to parse CSV", csv_path, ":", e)
+            print("Failed to parse CSV", csv_path, ":", e, file=sys.stderr)
             continue
 
-        # determine kernel duration from CSV (Duration metadata typically in ns)
+        # duration from CSV (ns -> s) preference
         duration_seconds = None
         for k, v in metric_agg.items():
             if 'duration' in k.lower():
                 try:
-                    # metric_agg stores mean values; ncu Duration is in ns -> convert to seconds
                     duration_seconds = float(v) / 1e9
                     break
                 except Exception:
                     duration_seconds = None
-        # build output record: set ncu_time_s to kernel duration (per request) and keep wallclock
+
         out_rec = {
             'benchmark': bench_name,
             'params': "_".join(str(x) for x in param_set),
@@ -518,33 +554,27 @@ def main():
             'ncu_time_s_wallclock': round(run_elapsed or 0.0, 3)
         }
 
-        # Match requested metrics against metric_agg keys, preferring to use CSV's canonical metric name
+        # match requested metrics -> CSV canonical metric names (use canonical name in summary)
         requested = [m.strip() for m in args.metrics.split(',') if m.strip()]
         metric_keys = list(metric_agg.keys())
-
-        # For each requested token, find best match in CSV metrics. If matched, use the CSV metric name as
-        # the summary column header (so summary keeps CSV's canonical labels).
         for req in requested:
             rn = re.sub(r'[^a-z0-9]', '', req.lower())
             matched = find_best_match_for_requested(rn, metric_keys)
             if matched:
-                # put aggregated value under the CSV metric name
                 out_rec[matched] = metric_agg.get(matched, "")
             else:
-                # fallback: put empty column with requested label (user may want it)
+                # keep requested label if no match
                 out_rec[req] = ""
 
         summary_rows.append(out_rec)
-        # remove empty log after success unless keep-logs requested
         if not args.keep_logs:
             remove_empty_file(log_path)
 
-    # Write summary: union of all keys across all rows (ensures columns exist even if not present in first row)
+    # write summary (union of keys across rows)
     if summary_rows:
         all_keys = set()
         for r in summary_rows:
             all_keys.update(r.keys())
-        # prefer a sane column order for common fields
         preferred = ['benchmark','params','ncu_csv','ncu_set','ncu_time_s','ncu_time_s_wallclock']
         other_keys = sorted([k for k in all_keys if k not in preferred])
         fieldnames = [k for k in preferred if k in all_keys] + other_keys
@@ -552,7 +582,6 @@ def main():
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for r in summary_rows:
-                # ensure all keys exist in row
                 row = {k: r.get(k, "") for k in fieldnames}
                 writer.writerow(row)
         print("Wrote summary to", args.summary)

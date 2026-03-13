@@ -19,3 +19,16 @@
     --ncu-binary ncu --ncu-set basic --launch-skip 0 --launch-count 1 \
     --ncu-out reports/ncu --metrics "sm_efficiency,achieved_occupancy" \
     --ncu-args ""
+
+TMPDIR=/mnt/disk3/yusheng/tmp_ncu XDG_RUNTIME_DIR=/mnt/disk3/yusheng/tmp_ncu ./run_ncu_bench.py --bench cuda \
+    --bench-dir /mnt/disk3/yusheng/HeCBench/src \
+    --ncu-binary ncu --ncu-set basic \
+    --launch-skip 0 --launch-count 100 \
+    --ncu-out reports/ncu \
+    --summary ncu_summary.csv \
+    --keep-logs
+
+TMPDIR=/mnt/disk3/yusheng/tmp_ncu XDG_RUNTIME_DIR=/mnt/disk3/yusheng/tmp_ncu ncu --set basic --csv --launch-skip 0 --launch-count 10 -- /mnt/disk3/yusheng/HeCBench/src/backprop-cuda/main 4096
+
+python3 extract_reports.py --reports reports/ncu --set basic --out ncu_reports_summary.csv --metrics "Achieved Occupancy,Compute (SM) Throughput,DRAM Throughput,Memory Throughput"
+
