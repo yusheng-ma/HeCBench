@@ -1,2 +1,5 @@
 reports/
 vtune_results/
+
+!benchmarks/subset.json
+!benchmarks/subset-fails.txt
