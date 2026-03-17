@@ -378,7 +378,7 @@ def main():
     print("\n⚡ Generating optimized kernel code...")
     start_time_r2 = time.time()
     sampling_params_2 = SamplingParams(
-        temperature=0.5,
+        temperature=0.7,
         top_p=0.9,
         max_tokens=MAX_TOKENS,
     )
