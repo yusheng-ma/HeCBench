@@ -3,8 +3,8 @@
 // Kernel: kernel_layerforward
 // ============================================================================
 
-#ifndef BPNN_LAYERFORWARD_R2_BPNN_LAYERFORWARD_H
-#define BPNN_LAYERFORWARD_R2_BPNN_LAYERFORWARD_H
+#ifndef BPNN_LAYERFORWARD_R1_BPNN_LAYERFORWARD_H
+#define BPNN_LAYERFORWARD_R1_BPNN_LAYERFORWARD_H
 
 #include <cuda.h>
 
@@ -52,4 +52,4 @@ __global__ void kernel_layerforward(
   }
 }
 
-#endif // BPNN_LAYERFORWARD_R2_BPNN_LAYERFORWARD_H
+#endif // BPNN_LAYERFORWARD_R1_BPNN_LAYERFORWARD_H
