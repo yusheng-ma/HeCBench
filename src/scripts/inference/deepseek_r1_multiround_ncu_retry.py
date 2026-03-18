@@ -46,9 +46,9 @@ PERFORMANCE_IMPROVEMENT_THRESHOLD = 0.05
 
 # LLM Configuration
 # 👇 修改點 1: 模型名稱改為 32B
-LLM_MODEL = "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" 
-LLM_MAX_MODEL_LEN = 32768
-LLM_GPU_MEMORY_UTIL = 0.85         # 4090 顯存較大，可稍微調高利用率 (原為 0.80)
+LLM_MODEL = "Valdemardi/DeepSeek-R1-Distill-Qwen-32B-AWQ" 
+LLM_MAX_MODEL_LEN = 4096
+LLM_GPU_MEMORY_UTIL = 0.9         # 4090 顯存較大，可稍微調高利用率 (原為 0.80)
 LLM_TEMPERATURE_BASE = 0.5         # 32B 模型更穩定，降低溫度以減少隨機錯誤 (原為 0.6)
 LLM_TEMPERATURE_MAX = 0.7          # 最高溫度也相應降低 (原為 0.9)
 LLM_TEMPERATURE_INCREMENT = 0.05
@@ -163,7 +163,7 @@ def run_ncu_profiler(binary_path: str, args: List[str] = None,
     if args is None:
         args = []
     
-    cmd = ["sudo", "-E", "ncu", "--set", "basic", binary_path] + [str(a) for a in args]
+    cmd = ["ncu", "--set", "basic", binary_path] + [str(a) for a in args]
     print(f"🔬 Running ncu: {' '.join(cmd)}")
     
     try:
@@ -432,7 +432,7 @@ No code, no explanations."""
 
 def build_round1_prompt() -> str:
     """Build prompt for naive/initial implementation"""
-    return """# Role
+    return """<|begin_of_sentence|><|User|># Role
 You are an expert CUDA Developer.
 
 # Task
@@ -489,13 +489,12 @@ __shared__ float weight_matrix[HEIGHT * WIDTH];
 # Output Requirement
 - Return ONLY the CUDA code inside ```cuda ... ``` blocks
 - Ensure signature matches Target Kernel Specification exactly
-- Ensure code compiles with nvcc
-"""
+- Ensure code compiles with nvcc<|Assistant|>"""
 
 
 def build_round2_prompt(naive_code: str, ncu_report: str) -> str:
     """Build prompt for optimized implementation"""
-    return f"""# Role
+    return f"""<|begin_of_sentence|><|User|># Role
 You are an expert CUDA Developer specializing in performance optimization.
 
 # Task
@@ -532,8 +531,7 @@ int by = blockIdx.y;
 - Return ONLY the optimized CUDA code inside ```cuda ... ``` blocks
 - Ensure signature matches exactly
 - Ensure code compiles with nvcc
-- Add brief comments explaining key optimizations made
-"""
+- Add brief comments explaining key optimizations made<|Assistant|>"""
 
 
 def enhance_prompt_with_retry_context(base_prompt: str, memory: RetryMemory, 
@@ -878,7 +876,7 @@ def main():
         gpu_memory_utilization=LLM_GPU_MEMORY_UTIL,
         enforce_eager=False,
         trust_remote_code=True,
-        tensor_parallel_size=4
+        tensor_parallel_size=1
     )
     print("✅ LLM ready")
     
