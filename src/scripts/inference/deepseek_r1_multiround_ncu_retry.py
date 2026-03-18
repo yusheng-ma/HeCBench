@@ -22,7 +22,7 @@ from vllm import LLM, SamplingParams
 # ============================================================================
 
 # Paths
-BASE_DIR = "/mnt/data1/yusheng/HeCBench/src/scripts/inference"
+BASE_DIR = "."
 TESTCASE_DIR = os.path.join(BASE_DIR, "testcases/backprop-cuda")
 HEADER_NAME = "bpnn_layerforward.h"
 
@@ -35,22 +35,23 @@ NCU_REPORT_R1 = os.path.join(BASE_DIR, "ncu_report_round1.txt")
 NCU_REPORT_R2 = os.path.join(BASE_DIR, "ncu_report_round2.txt")
 
 # Retry Configuration
-MAX_RETRIES = 5                    # Maximum retry attempts per round
-RETRY_DELAY_BASE = 2               # Base delay for exponential backoff (seconds)
-RETRY_DELAY_JITTER = 0.2           # Jitter factor (0.2 = ±20% randomization)
+MAX_RETRIES = 3                    # 32B 模型更聰明，3 次通常足夠，節省時間 (原為 5)
+RETRY_DELAY_BASE = 2               
+RETRY_DELAY_JITTER = 0.2           
 
 # Strategy Configuration
-CONVERSATIONAL_DEPTH = 2           # Keep last N attempts in memory
-SELF_REFLECT_AFTER_ATTEMPT = 2     # Enable self-reflection after this attempt
-PERFORMANCE_IMPROVEMENT_THRESHOLD = 0.05  # Minimum 5% improvement for R2 acceptance
+CONVERSATIONAL_DEPTH = 2           
+SELF_REFLECT_AFTER_ATTEMPT = 1     # 32B 模型第一次失敗後就能給出高質量反思 (原為 2)
+PERFORMANCE_IMPROVEMENT_THRESHOLD = 0.05  
 
 # LLM Configuration
-LLM_MODEL = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+# 👇 修改點 1: 模型名稱改為 32B
+LLM_MODEL = "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" 
 LLM_MAX_MODEL_LEN = 32768
-LLM_GPU_MEMORY_UTIL = 0.80
-LLM_TEMPERATURE_BASE = 0.6
-LLM_TEMPERATURE_MAX = 0.9
-LLM_TEMPERATURE_INCREMENT = 0.05   # Increase per retry attempt
+LLM_GPU_MEMORY_UTIL = 0.85         # 4090 顯存較大，可稍微調高利用率 (原為 0.80)
+LLM_TEMPERATURE_BASE = 0.5         # 32B 模型更穩定，降低溫度以減少隨機錯誤 (原為 0.6)
+LLM_TEMPERATURE_MAX = 0.7          # 最高溫度也相應降低 (原為 0.9)
+LLM_TEMPERATURE_INCREMENT = 0.05
 
 # ============================================================================
 # 📦 Data Classes for State Management
@@ -162,7 +163,7 @@ def run_ncu_profiler(binary_path: str, args: List[str] = None,
     if args is None:
         args = []
     
-    cmd = ["sudo", "ncu", "--set", "basic", binary_path] + [str(a) for a in args]
+    cmd = ["sudo", "-E", "ncu", "--set", "basic", binary_path] + [str(a) for a in args]
     print(f"🔬 Running ncu: {' '.join(cmd)}")
     
     try:
@@ -875,9 +876,9 @@ def main():
         model=LLM_MODEL,
         max_model_len=LLM_MAX_MODEL_LEN,
         gpu_memory_utilization=LLM_GPU_MEMORY_UTIL,
-        enforce_eager=True,
+        enforce_eager=False,
         trust_remote_code=True,
-        tensor_parallel_size=1
+        tensor_parallel_size=4
     )
     print("✅ LLM ready")
     
