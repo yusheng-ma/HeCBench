@@ -35,20 +35,20 @@ NCU_REPORT_R1 = os.path.join(BASE_DIR, "ncu_report_round1.txt")
 NCU_REPORT_R2 = os.path.join(BASE_DIR, "ncu_report_round2.txt")
 
 # Retry Configuration
-MAX_RETRIES = 3                    # 32B 模型更聰明，3 次通常足夠，節省時間 (原為 5)
+MAX_RETRIES = 5                    # 32B 模型更聰明，3 次通常足夠，節省時間 (原為 5)
 RETRY_DELAY_BASE = 2               
 RETRY_DELAY_JITTER = 0.2           
 
 # Strategy Configuration
 CONVERSATIONAL_DEPTH = 2           
-SELF_REFLECT_AFTER_ATTEMPT = 1     # 32B 模型第一次失敗後就能給出高質量反思 (原為 2)
+SELF_REFLECT_AFTER_ATTEMPT = 2     # 32B 模型第一次失敗後就能給出高質量反思 (原為 2)
 PERFORMANCE_IMPROVEMENT_THRESHOLD = 0.05  
 
 # LLM Configuration
 # 👇 修改點 1: 模型名稱改為 32B
-LLM_MODEL = "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" 
+LLM_MODEL = "Valdemardi/DeepSeek-R1-Distill-Qwen-32B-AWQ" 
 LLM_MAX_MODEL_LEN = 32768
-LLM_GPU_MEMORY_UTIL = 0.85         # 4090 顯存較大，可稍微調高利用率 (原為 0.80)
+LLM_GPU_MEMORY_UTIL = 0.80         # 4090 顯存較大，可稍微調高利用率 (原為 0.80)
 LLM_TEMPERATURE_BASE = 0.5         # 32B 模型更穩定，降低溫度以減少隨機錯誤 (原為 0.6)
 LLM_TEMPERATURE_MAX = 0.7          # 最高溫度也相應降低 (原為 0.9)
 LLM_TEMPERATURE_INCREMENT = 0.05
@@ -878,7 +878,7 @@ def main():
         gpu_memory_utilization=LLM_GPU_MEMORY_UTIL,
         enforce_eager=False,
         trust_remote_code=True,
-        tensor_parallel_size=4
+        tensor_parallel_size=1
     )
     print("✅ LLM ready")
     
