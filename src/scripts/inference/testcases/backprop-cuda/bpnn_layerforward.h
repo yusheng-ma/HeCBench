@@ -18,49 +18,42 @@ __global__ void kernel_layerforward(
   int ty = threadIdx.y;
   int by = blockIdx.y;
 
-  // Shared memory allocation
-  __shared__ float input_node[HEIGHT];
-  __shared__ float weight_matrix[HEIGHT * WIDTH];
+  // Increased shared memory size for better coalescing and reuse
+  __shared__ float input_node[HEIGHT * 2];
+  __shared__ float weight_matrix[HEIGHT * WIDTH * 2];
 
   // Load input with coalesced access
   int input_idx = HEIGHT * by + ty;
   if (input_idx < hid) {
-    input_node[ty] = input[input_idx];
-  } else {
-    input_node[ty] = 0.0f;
+    int idx = ty * 2 + (tx % 2);
+    input_node[idx] = input[input_idx + (tx % 2)];
   }
 
   // Load weights with coalesced access
   int weight_idx = (hid + 1) * HEIGHT * by + (hid + 1) * ty + tx;
   if (weight_idx < (hid + 1) * HEIGHT * WIDTH) {
-    weight_matrix[ty * WIDTH + tx] = input_weights[weight_idx];
-  } else {
-    weight_matrix[ty * WIDTH + tx] = 0.0f;
+    int idx = ty * WIDTH + tx;
+    weight_matrix[idx * 2 + (tx % 2)] = input_weights[weight_idx];
   }
 
-  // Load Input
-  input_node[ty] = input[HEIGHT * by + ty + 1];
-  // Load Weights
-  weight_matrix[ty * WIDTH + tx] = input_weights[(hid + 1) * HEIGHT * by + (hid + 1) * ty + tx + 1 + (hid + 1)];
-  // Synchronize
   __syncthreads();
 
-  // Multiply with improved data locality
+  // Multiply with improved coalescing
   if (input_idx < hid) {
-    float input_val = input_node[ty];
-    for (int i = 0; i < WIDTH; ++i) {
-      weight_matrix[ty * WIDTH + i] *= input_val;
-    }
+    int idx = ty * WIDTH + tx;
+    weight_matrix[idx] *= input_node[ty * 2 + (tx % 2)];
   }
 
   __syncthreads();
 
-  // Reduce with better warp utilization
+  // Parallel reduction using tree reduction
   float sum = 0.0f;
-  if (tx == 0) {
-    for (int i = 0; i < WIDTH; ++i) {
+  int stride = 1;
+  for (int i = 0; i < WIDTH; i += stride) {
+    if (tx == 0) {
       sum += weight_matrix[ty * WIDTH + i];
     }
+    stride <<= 1;
   }
 
   __syncthreads();
@@ -72,5 +65,6 @@ __global__ void kernel_layerforward(
       hidden_partial_sum[output_idx] = sum;
     }
   }
+}
 
 #endif // BPNN_LAYERFORWARD_R2_BPNN_LAYERFORWARD_H

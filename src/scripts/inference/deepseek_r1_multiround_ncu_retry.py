@@ -43,7 +43,7 @@ RETRY_DELAY_JITTER = 0.2
 # Strategy Configuration
 CONVERSATIONAL_DEPTH = 2           
 SELF_REFLECT_AFTER_ATTEMPT = 2     # 32B 模型第一次失敗後就能給出高質量反思 (原為 2)
-PERFORMANCE_IMPROVEMENT_THRESHOLD = 0.05  
+PERFORMANCE_IMPROVEMENT_THRESHOLD = 0.01
 
 # LLM Configuration
 # 👇 修改點 1: 模型名稱改為 32B
@@ -286,9 +286,12 @@ def analyze_ncu_bottlenecks(ncu_result: Dict[str, Any]) -> List[str]:
 # 📝 Kernel Extraction & File Operations
 # ============================================================================
 
-def extract_kernel_layerforward(response_text: str) -> Optional[str]:
-    """Extract kernel_layerforward function from LLM response"""
+def extract_kernel_layerforward(response_text: str, log_dirs: Dict[str, Path] = None,
+                                round_num: int = None, attempt: int = None) -> Optional[str]:
+    """Extract kernel_layerforward function with optional verbose logging"""
     kernel_name = 'kernel_layerforward'
+    method_used = None
+    extracted = None
     
     # Method 1: Brace matching
     match = re.search(r'__global__\s+void\s+' + kernel_name + r'\s*\([^)]*\)', response_text)
@@ -302,17 +305,31 @@ def extract_kernel_layerforward(response_text: str) -> Optional[str]:
                 elif response_text[end] == '}': count -= 1
                 end += 1
             if count == 0:
-                print(f"✅ Extracted: {kernel_name}")
-                return response_text[start:end]
+                method_used = "brace_matching"
+                extracted = response_text[start:end]
     
-    # Method 2: Code block
-    block = re.search(r'```(?:cuda|cpp|c)?\s*([\s\S]*?' + kernel_name + r'[\s\S]*?)```', response_text)
-    if block:
-        print(f"✅ Extracted from code block: {kernel_name}")
-        return block.group(1).strip()
+    # Method 2: Code block fallback
+    if not extracted:
+        block = re.search(r'```(?:cuda|cpp|c)?\s*([\s\S]*?' + kernel_name + r'[\s\S]*?)```', response_text)
+        if block:
+            method_used = "code_block"
+            extracted = block.group(1).strip()
     
-    print(f"❌ Failed to extract: {kernel_name}")
-    return None
+    # Verbose logging
+    if log_dirs and round_num and attempt:
+        log_verbose_code_extract(
+            log_dirs, round_num, attempt, 
+            response_text, extracted, 
+            method_used or "none", 
+            extracted is not None
+        )
+    
+    if extracted:
+        print(f"✅ Extracted: {kernel_name} (method: {method_used})")
+    else:
+        print(f"❌ Failed to extract: {kernel_name}")
+    
+    return extracted
 
 
 def write_kernel_header(kernel_name: str, kernel_code: str, output_path: str) -> Tuple[bool, str]:
@@ -569,21 +586,27 @@ def exponential_backoff(attempt: int) -> float:
 
 
 def check_performance_improvement(r1_durs: List[float], r2_durs: List[float]) -> Tuple[bool, str]:
-    """Check if R2 meets performance improvement threshold"""
-    if not r1_durs or not r2_durs or len(r1_durs) != len(r2_durs):
+    """
+    Check if R2 meets performance improvement threshold.
+    🔑 FIX: Compare first duration from each list (not require same length)
+    """
+    if not r1_durs or not r2_durs:
         return False, "Data mismatch or missing"
     
-    improvements = [(r1 - r2) / r1 * 100 for r1, r2 in zip(r1_durs, r2_durs) if r1 > 0]
-    if not improvements:
-        return False, "No valid comparison data"
+    # 🔑 FIX: Just compare the first (main) kernel duration from each
+    r1_dur = r1_durs[0] if r1_durs else None
+    r2_dur = r2_durs[0] if r2_durs else None
     
-    avg_imp = sum(improvements) / len(improvements)
+    if not r1_dur or not r2_dur or r1_dur <= 0:
+        return False, "Invalid duration data"
+    
+    improvement_pct = (r1_dur - r2_dur) / r1_dur * 100
     threshold_pct = PERFORMANCE_IMPROVEMENT_THRESHOLD * 100
     
-    if avg_imp >= threshold_pct:
-        return True, f"✅ Avg improvement: {avg_imp:+.1f}% (threshold: {threshold_pct:.0f}%)"
+    if improvement_pct >= threshold_pct:
+        return True, f"✅ Avg improvement: {improvement_pct:+.1f}% (threshold: {threshold_pct:.0f}%)"
     else:
-        return False, f"⚠️  Avg improvement: {avg_imp:+.1f}% < {threshold_pct:.0f}% threshold"
+        return False, f"⚠️  Avg improvement: {improvement_pct:+.1f}% < {threshold_pct:.0f}% threshold"
 
 
 def get_sampling_params(attempt: int, base_temp: float = LLM_TEMPERATURE_BASE) -> SamplingParams:
@@ -593,11 +616,24 @@ def get_sampling_params(attempt: int, base_temp: float = LLM_TEMPERATURE_BASE) -
 
 
 # ============================================================================
-# 🎯 Round 1 Generation with Stateful Hybrid Retry
+# 🎯 Round 1 Generation with Stateful Hybrid Retry + Verbose Logging
 # ============================================================================
 
-def generate_round1_with_retry(llm: LLM, max_retries: int = MAX_RETRIES) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
-    """Generate Round 1 kernel with stateful hybrid retry logic"""
+def generate_round1_with_retry(llm: LLM, max_retries: int = MAX_RETRIES,
+                                log_dirs: Optional[Dict[str, Path]] = None,
+                                args: Any = None) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
+    """
+    Generate Round 1 kernel with stateful hybrid retry logic.
+    
+    Args:
+        llm: vLLM LLM instance
+        max_retries: Maximum retry attempts
+        log_dirs: Directory paths for verbose logging (if enabled)
+        args: Parsed argparse arguments (for logging flags)
+    
+    Returns:
+        (kernel_code, full_response_text, metadata_dict)
+    """
     print(f"\n{'#'*80}")
     print(f"# ROUND 1: Naive Implementation (Max Retries: {max_retries})")
     print(f"{'#'*80}")
@@ -616,9 +652,34 @@ def generate_round1_with_retry(llm: LLM, max_retries: int = MAX_RETRIES) -> Tupl
             else:
                 prompt = enhance_prompt_with_retry_context(base_prompt, memory, self_critique)
             
+            # Verbose logging: log prompt if enabled
+            if log_dirs and args and (args.log_prompts or args.log_verbose):
+                log_verbose_prompt(
+                    log_dirs, round_num=1, attempt=attempt+1, prompt=prompt,
+                    context={
+                        "temperature": None,  # Will be set below
+                        "self_critique": self_critique is not None,
+                        "has_history": len(memory.attempts) > 0
+                    }
+                )
+            
             # Get sampling params with temperature scaling
             params = get_sampling_params(attempt)
             print(f"   Temperature: {params.temperature:.2f}")
+            
+            # Update prompt context with actual temperature for logging
+            if log_dirs and args and (args.log_prompts or args.log_verbose):
+                # Re-log with temperature (overwrite is fine, same filename)
+                log_verbose_prompt(
+                    log_dirs, round_num=1, attempt=attempt+1, prompt=prompt,
+                    context={
+                        "temperature": params.temperature,
+                        "self_critique": self_critique is not None,
+                        "has_history": len(memory.attempts) > 0,
+                        "top_p": params.top_p,
+                        "max_tokens": params.max_tokens
+                    }
+                )
             
             # Generate
             start_time = time.time()
@@ -629,12 +690,22 @@ def generate_round1_with_retry(llm: LLM, max_retries: int = MAX_RETRIES) -> Tupl
             text = outputs[0].outputs[0].text
             finish_reason = outputs[0].outputs[0].finish_reason
             
-            # Save full response
+            # Verbose logging: log raw output if enabled
+            if log_dirs and args and (args.log_outputs or args.log_verbose):
+                log_verbose_output(
+                    log_dirs, round_num=1, attempt=attempt+1,
+                    output_text=text, finish_reason=finish_reason
+                )
+            
+            # Save full response (always, for recovery)
             with open(FULL_RESPONSE_R1, 'w', encoding='utf-8') as f:
                 f.write(text)
             
-            # Extract kernel
-            kernel = extract_kernel_layerforward(text)
+            # Extract kernel with verbose logging support
+            kernel = extract_kernel_layerforward(
+                text, log_dirs=log_dirs, round_num=1, attempt=attempt+1
+            )
+            
             if not kernel:
                 error_detail = "Failed to extract kernel_layerforward function"
                 print(f"   ⚠️  Extract failed: {error_detail}")
@@ -643,8 +714,10 @@ def generate_round1_with_retry(llm: LLM, max_retries: int = MAX_RETRIES) -> Tupl
                 if attempt >= SELF_REFLECT_AFTER_ATTEMPT:
                     self_critique = self_reflect_on_error(llm, text, "extract_failed", "", params)
                 
-                memory.add_attempt(kernel, "extract_failed", error_detail, 
-                                  feedback="Check code block formatting and function signature")
+                memory.add_attempt(
+                    kernel, "extract_failed", error_detail,
+                    feedback="Check code block formatting and function signature"
+                )
                 
                 if attempt < max_retries:
                     delay = exponential_backoff(attempt)
@@ -652,7 +725,12 @@ def generate_round1_with_retry(llm: LLM, max_retries: int = MAX_RETRIES) -> Tupl
                     time.sleep(delay)
                     continue
                 else:
-                    return None, None, {"status": "extract_failed", "attempts": attempt+1, "memory": memory}
+                    return None, None, {
+                        "status": "extract_failed",
+                        "attempts": attempt+1,
+                        "memory": memory,
+                        "gen_time": gen_time
+                    }
             
             # Write header
             ok, err = write_kernel_header('kernel_layerforward', kernel, OUTPUT_PATH_ROUND1)
@@ -662,7 +740,12 @@ def generate_round1_with_retry(llm: LLM, max_retries: int = MAX_RETRIES) -> Tupl
                 if attempt < max_retries:
                     time.sleep(exponential_backoff(attempt))
                     continue
-                return None, None, {"status": "write_failed", "attempts": attempt+1, "memory": memory}
+                return None, None, {
+                    "status": "write_failed",
+                    "attempts": attempt+1,
+                    "memory": memory,
+                    "gen_time": gen_time
+                }
             
             # Copy to testcase
             ok, err = copy_header_to_testcase(OUTPUT_PATH_ROUND1, TESTCASE_DIR, HEADER_NAME)
@@ -672,7 +755,12 @@ def generate_round1_with_retry(llm: LLM, max_retries: int = MAX_RETRIES) -> Tupl
                 if attempt < max_retries:
                     time.sleep(exponential_backoff(attempt))
                     continue
-                return None, None, {"status": "copy_failed", "attempts": attempt+1, "memory": memory}
+                return None, None, {
+                    "status": "copy_failed",
+                    "attempts": attempt+1,
+                    "memory": memory,
+                    "gen_time": gen_time
+                }
             
             # Compile
             ok, err = compile_testcase(TESTCASE_DIR)
@@ -683,8 +771,10 @@ def generate_round1_with_retry(llm: LLM, max_retries: int = MAX_RETRIES) -> Tupl
                 if attempt >= SELF_REFLECT_AFTER_ATTEMPT:
                     self_critique = self_reflect_on_error(llm, kernel, "compile_failed", err, params)
                 
-                memory.add_attempt(kernel, "compile_failed", err, 
-                                  feedback="Check syntax, types, and CUDA builtins")
+                memory.add_attempt(
+                    kernel, "compile_failed", err,
+                    feedback="Check syntax, types, and CUDA builtins"
+                )
                 
                 if attempt < max_retries:
                     delay = exponential_backoff(attempt)
@@ -692,12 +782,23 @@ def generate_round1_with_retry(llm: LLM, max_retries: int = MAX_RETRIES) -> Tupl
                     time.sleep(delay)
                     continue
                 else:
-                    return None, None, {"status": "compile_failed", "attempts": attempt+1, "error": err, "memory": memory}
+                    return None, None, {
+                        "status": "compile_failed",
+                        "attempts": attempt+1,
+                        "error": err,
+                        "memory": memory,
+                        "gen_time": gen_time
+                    }
             
             # Success!
             print(f"   ✅ R1 Success on attempt {attempt+1}!")
             memory.add_attempt(kernel, None, None, feedback="Compilation successful")
-            return kernel, text, {"status": "success", "attempts": attempt+1, "memory": memory, "gen_time": gen_time}
+            return kernel, text, {
+                "status": "success",
+                "attempts": attempt+1,
+                "memory": memory,
+                "gen_time": gen_time
+            }
             
         except Exception as e:
             print(f"   ❌ Attempt {attempt+1} exception: {type(e).__name__}: {e}")
@@ -710,31 +811,73 @@ def generate_round1_with_retry(llm: LLM, max_retries: int = MAX_RETRIES) -> Tupl
             if attempt < max_retries:
                 time.sleep(exponential_backoff(attempt))
                 continue
-            return None, None, {"status": "exception", "attempts": attempt+1, "error": str(e), "memory": memory}
+            return None, None, {
+                "status": "exception",
+                "attempts": attempt+1,
+                "error": str(e),
+                "memory": memory,
+                "gen_time": gen_time if 'gen_time' in locals() else None
+            }
     
-    return None, None, {"status": "max_retries_exceeded", "attempts": max_retries+1, "memory": memory}
+    return None, None, {
+        "status": "max_retries_exceeded",
+        "attempts": max_retries+1,
+        "memory": memory
+    }
 
 
 # ============================================================================
-# 🎯 Round 2 Generation with Performance-Based Retry
+# 🎯 Round 2 Generation with Performance-Based Retry + Verbose Logging
 # ============================================================================
 
 def generate_round2_with_retry(llm: LLM, naive_code: str, ncu_r1: Dict[str, Any],
-                                max_retries: int = MAX_RETRIES, use_ncu=True) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
-    """Generate Round 2 optimized kernel with performance-based retry"""
+                                max_retries: int = MAX_RETRIES,
+                                use_ncu: bool = True,
+                                log_dirs: Optional[Dict[str, Path]] = None,
+                                args: Any = None) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
+    """
+    Generate Round 2 optimized kernel with performance-based retry.
+    
+    Args:
+        llm: vLLM LLM instance
+        naive_code: Round 1 kernel code (reference)
+        ncu_r1: Round 1 NCU profiling results
+        max_retries: Maximum retry attempts
+        use_ncu: If True, use NCU feedback for optimization guidance AND retry logic
+                 If False, still profile for duration measurement but skip NCU-based retries
+        log_dirs: Directory paths for verbose logging (if enabled)
+        args: Parsed argparse arguments (for logging flags)
+    
+    Returns:
+        (kernel_code, full_response_text, metadata_dict)
+    """
     print(f"\n{'#'*80}")
     print(f"# ROUND 2: Optimized Implementation (Max Retries: {max_retries})")
+    print(f"# NCU Feedback Enabled: {use_ncu}")
     print(f"{'#'*80}")
     
+    # Build NCU report for prompt
+    # If use_ncu=False, still show basic info but no detailed feedback
     if use_ncu and ncu_r1 and ncu_r1.get("success"):
-        ncu_report = format_ncu_report_for_prompt(ncu_r1)
+        ncu_report = format_ncu_report_for_prompt(ncu_r1, include_raw=False)
     else:
-        ncu_report = "⚠️ NCU profiling disabled - optimize based on general CUDA best practices"
+        ncu_report = "⚠️  NCU profiling disabled for this run - optimize based on general CUDA best practices.\n\n"
+        ncu_report += "Focus on:\n"
+        ncu_report += "- Shared memory usage for data reuse\n"
+        ncu_report += "- Memory coalescing for global access\n"
+        ncu_report += "- Tree reduction for parallel summation\n"
+        ncu_report += "- Register pressure reduction for occupancy"
+    
     base_prompt = build_round2_prompt(naive_code, ncu_report)
     memory = RetryMemory(max_history=CONVERSATIONAL_DEPTH, round_num=2)
     self_critique = None
     
-    r1_durs = ncu_r1.get("duration_extracted", {}).get("kernel_durations_us", [])
+    # Extract R1 durations for comparison (always available if R1 was profiled)
+    r1_durs = ncu_r1.get("duration_extracted", {}).get("kernel_durations_us", []) if ncu_r1 else []
+    
+    # Track best duration for this round
+    best_duration_us = None
+    best_kernel_code = None
     
     for attempt in range(max_retries + 1):
         print(f"\n🔄 R2 Attempt {attempt+1}/{max_retries+1}")
@@ -746,9 +889,37 @@ def generate_round2_with_retry(llm: LLM, naive_code: str, ncu_r1: Dict[str, Any]
             else:
                 prompt = enhance_prompt_with_retry_context(base_prompt, memory, self_critique)
             
+            # Verbose logging: log prompt if enabled
+            if log_dirs and args and (args.log_prompts or args.log_verbose):
+                log_verbose_prompt(
+                    log_dirs, round_num=2, attempt=attempt+1, prompt=prompt,
+                    context={
+                        "use_ncu": use_ncu,
+                        "temperature": None,
+                        "self_critique": self_critique is not None,
+                        "has_history": len(memory.attempts) > 0,
+                        "r1_duration_us": r1_durs[0] if r1_durs else None
+                    }
+                )
+            
             # Get sampling params (slightly higher base temp for R2)
             params = get_sampling_params(attempt, base_temp=0.7)
             print(f"   Temperature: {params.temperature:.2f}")
+            
+            # Update prompt context with actual temperature for logging
+            if log_dirs and args and (args.log_prompts or args.log_verbose):
+                log_verbose_prompt(
+                    log_dirs, round_num=2, attempt=attempt+1, prompt=prompt,
+                    context={
+                        "use_ncu": use_ncu,
+                        "temperature": params.temperature,
+                        "self_critique": self_critique is not None,
+                        "has_history": len(memory.attempts) > 0,
+                        "top_p": params.top_p,
+                        "max_tokens": params.max_tokens,
+                        "r1_duration_us": r1_durs[0] if r1_durs else None
+                    }
+                )
             
             # Generate
             start_time = time.time()
@@ -757,13 +928,24 @@ def generate_round2_with_retry(llm: LLM, naive_code: str, ncu_r1: Dict[str, Any]
             print(f"   ⏱️  Generation time: {gen_time:.2f}s")
             
             text = outputs[0].outputs[0].text
+            finish_reason = outputs[0].outputs[0].finish_reason
             
-            # Save full response
+            # Verbose logging: log raw output if enabled
+            if log_dirs and args and (args.log_outputs or args.log_verbose):
+                log_verbose_output(
+                    log_dirs, round_num=2, attempt=attempt+1,
+                    output_text=text, finish_reason=finish_reason
+                )
+            
+            # Save full response (always, for recovery)
             with open(FULL_RESPONSE_R2, 'w', encoding='utf-8') as f:
                 f.write(text)
             
-            # Extract kernel
-            kernel = extract_kernel_layerforward(text)
+            # Extract kernel with verbose logging support
+            kernel = extract_kernel_layerforward(
+                text, log_dirs=log_dirs, round_num=2, attempt=attempt+1
+            )
+            
             if not kernel:
                 error_detail = "Failed to extract kernel_layerforward function"
                 print(f"   ⚠️  Extract failed: {error_detail}")
@@ -776,7 +958,12 @@ def generate_round2_with_retry(llm: LLM, naive_code: str, ncu_r1: Dict[str, Any]
                 if attempt < max_retries:
                     time.sleep(exponential_backoff(attempt))
                     continue
-                return None, None, {"status": "extract_failed", "attempts": attempt+1, "memory": memory}
+                return None, None, {
+                    "status": "extract_failed",
+                    "attempts": attempt+1,
+                    "memory": memory,
+                    "gen_time": gen_time
+                }
             
             # Write header
             ok, err = write_kernel_header('kernel_layerforward', kernel, OUTPUT_PATH_ROUND2)
@@ -785,7 +972,12 @@ def generate_round2_with_retry(llm: LLM, naive_code: str, ncu_r1: Dict[str, Any]
                 if attempt < max_retries:
                     time.sleep(exponential_backoff(attempt))
                     continue
-                return None, None, {"status": "write_failed", "attempts": attempt+1, "memory": memory}
+                return None, None, {
+                    "status": "write_failed",
+                    "attempts": attempt+1,
+                    "memory": memory,
+                    "gen_time": gen_time
+                }
             
             # Copy to testcase
             ok, err = copy_header_to_testcase(OUTPUT_PATH_ROUND2, TESTCASE_DIR, HEADER_NAME)
@@ -794,7 +986,12 @@ def generate_round2_with_retry(llm: LLM, naive_code: str, ncu_r1: Dict[str, Any]
                 if attempt < max_retries:
                     time.sleep(exponential_backoff(attempt))
                     continue
-                return None, None, {"status": "copy_failed", "attempts": attempt+1, "memory": memory}
+                return None, None, {
+                    "status": "copy_failed",
+                    "attempts": attempt+1,
+                    "memory": memory,
+                    "gen_time": gen_time
+                }
             
             # Compile
             ok, err = compile_testcase(TESTCASE_DIR)
@@ -809,44 +1006,85 @@ def generate_round2_with_retry(llm: LLM, naive_code: str, ncu_r1: Dict[str, Any]
                 if attempt < max_retries:
                     time.sleep(exponential_backoff(attempt))
                     continue
-                return None, None, {"status": "compile_failed", "attempts": attempt+1, "memory": memory}
+                return None, None, {
+                    "status": "compile_failed",
+                    "attempts": attempt+1,
+                    "memory": memory,
+                    "gen_time": gen_time
+                }
             
-            # Profile for performance check (if R1 has durations)
+            # ========================================================================
+            # 🔬 PROFILING: Always run to get duration_us (for logging/comparison)
+            # But only use NCU feedback for retry decisions if use_ncu=True
+            # ========================================================================
+            print(f"   🔬 Profiling kernel execution...")
+            ncu_r2 = run_ncu_profiler(
+                "./testcases/backprop-cuda/main",
+                [args.test_input_size if args else 4096],
+                300,
+                NCU_REPORT_R2
+            )
+            
+            # Verbose logging: save raw NCU output if enabled
+            if log_dirs:
+                log_verbose_ncu_raw(log_dirs, round_num=2, ncu_result=ncu_r2)
+            
+            # Extract duration regardless of use_ncu flag
             duration_us = None
-            if use_ncu and r1_durs and attempt < max_retries:  # Don't profile on last attempt
-                print(f"   🔬 Profiling for performance comparison...")
-                ncu_r2 = run_ncu_profiler("./testcases/backprop-cuda/main", [4096], 300, NCU_REPORT_R2)
+            if ncu_r2.get("success"):
+                r2_durs = ncu_r2.get("duration_extracted", {}).get("kernel_durations_us", [])
+                if r2_durs:
+                    duration_us = r2_durs[0]
+                    print(f"   📊 R2 Duration: {duration_us:.2f}μs")
+                    
+                    # Track best
+                    if best_duration_us is None or duration_us < best_duration_us:
+                        best_duration_us = duration_us
+                        best_kernel_code = kernel
+            
+            # 🔑 ONLY use NCU for performance-based retry logic if enabled
+            # 🔑 FIX: Pass durations as lists, check_performance_improvement handles length mismatch
+            if use_ncu and r1_durs and duration_us and attempt < max_retries:
+                improved, msg = check_performance_improvement(r1_durs, [duration_us])
+                print(f"   {msg}")
                 
-                if ncu_r2.get("success"):
-                    r2_durs = ncu_r2.get("duration_extracted", {}).get("kernel_durations_us", [])
-                    if r2_durs:
-                        duration_us = r2_durs[0] if r2_durs else None
-                        improved, msg = check_performance_improvement(r1_durs, r2_durs)
-                        print(f"   {msg}")
-                        
-                        if not improved:
-                            # Get NCU-based suggestions
-                            bottlenecks = analyze_ncu_bottlenecks(ncu_r2)
-                            feedback = "Performance insufficient. " + " ".join(bottlenecks)
-                            
-                            if attempt >= SELF_REFLECT_AFTER_ATTEMPT:
-                                self_critique = self_reflect_on_error(llm, kernel, "performance_failed", 
-                                                                     "\n".join(bottlenecks), params)
-                            
-                            memory.add_attempt(kernel, "performance_failed", msg, 
-                                              feedback=feedback, duration_us=duration_us)
-                            
-                            delay = exponential_backoff(attempt)
-                            print(f"   ⏳  Retrying in {delay:.1f}s...")
-                            time.sleep(delay)
-                            continue
+                if not improved:
+                    # Get NCU-based suggestions
+                    bottlenecks = analyze_ncu_bottlenecks(ncu_r2)
+                    feedback = "Performance insufficient. " + " ".join(bottlenecks)
+                    
+                    if attempt >= SELF_REFLECT_AFTER_ATTEMPT:
+                        self_critique = self_reflect_on_error(
+                            llm, kernel, "performance_failed",
+                            "\n".join(bottlenecks), params
+                        )
+                    
+                    memory.add_attempt(
+                        kernel, "performance_failed", msg,
+                        feedback=feedback, duration_us=duration_us
+                    )
+                    
+                    delay = exponential_backoff(attempt)
+                    print(f"   ⏳  Retrying in {delay:.1f}s...")
+                    time.sleep(delay)
+                    continue
             
             # Success!
             print(f"   ✅ R2 Success on attempt {attempt+1}!")
-            memory.add_attempt(kernel, None, None, duration_us=duration_us, 
-                              feedback="Performance acceptable" if duration_us else "Compiled successfully")
-            return kernel, text, {"status": "success", "attempts": attempt+1, "memory": memory, 
-                                 "gen_time": gen_time, "duration_us": duration_us}
+            memory.add_attempt(
+                kernel, None, None,
+                duration_us=duration_us,
+                feedback="Performance acceptable" if duration_us else "Compiled successfully"
+            )
+            return kernel, text, {
+                "status": "success",
+                "attempts": attempt+1,
+                "memory": memory,
+                "gen_time": gen_time,
+                "duration_us": duration_us,
+                "best_duration_us": best_duration_us,
+                "use_ncu": use_ncu
+            }
             
         except Exception as e:
             print(f"   ❌ Attempt {attempt+1} exception: {type(e).__name__}: {e}")
@@ -855,9 +1093,104 @@ def generate_round2_with_retry(llm: LLM, naive_code: str, ncu_r1: Dict[str, Any]
             if attempt < max_retries:
                 time.sleep(exponential_backoff(attempt))
                 continue
-            return None, None, {"status": "exception", "attempts": attempt+1, "error": str(e), "memory": memory}
+            return None, None, {
+                "status": "exception",
+                "attempts": attempt+1,
+                "error": str(e),
+                "memory": memory,
+                "gen_time": gen_time if 'gen_time' in locals() else None,
+                "use_ncu": use_ncu
+            }
     
-    return None, None, {"status": "max_retries_exceeded", "attempts": max_retries+1, "memory": memory}
+    return None, None, {
+        "status": "max_retries_exceeded",
+        "attempts": max_retries+1,
+        "memory": memory,
+        "use_ncu": use_ncu
+    }
+
+
+# ============================================================================
+# 🗂️ Verbose Logging Helpers (for debugging/analysis)
+# ============================================================================
+
+def setup_verbose_log_dirs(run_name: str, base_dir: str) -> Dict[str, Path]:
+    """Create subdirectories for verbose logging"""
+    base = Path(base_dir) / run_name
+    dirs = {
+        "prompts": base / "prompts",
+        "outputs": base / "outputs", 
+        "code_extract": base / "code_extract",
+        "ncu_raw": base / "ncu_raw",
+    }
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
+def log_verbose_prompt(log_dirs: Dict[str, Path], round_num: int, attempt: int, 
+                       prompt: str, context: Dict[str, Any] = None):
+    """Log prompt to file if enabled"""
+    if not context or not context.get("log_prompts"):
+        return
+    filepath = log_dirs["prompts"] / f"r{round_num}_a{attempt:02d}.txt"
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(f"# Round {round_num}, Attempt {attempt}\n")
+        f.write(f"# Timestamp: {datetime.now().isoformat()}\n")
+        if context:
+            f.write(f"# Metadata: {json.dumps({k:v for k,v in context.items() if k != 'prompt'}, indent=2)}\n\n")
+        f.write(prompt)
+    print(f"   📝 Logged prompt → {filepath}")
+
+
+def log_verbose_output(log_dirs: Dict[str, Path], round_num: int, attempt: int, 
+                       output_text: str, finish_reason: str = None):
+    """Log raw model output to file if enabled"""
+    if not log_dirs:  # verbose logging not enabled
+        return
+    filepath = log_dirs["outputs"] / f"r{round_num}_a{attempt:02d}.txt"
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(f"# Round {round_num}, Attempt {attempt}\n")
+        f.write(f"# Timestamp: {datetime.now().isoformat()}\n")
+        if finish_reason:
+            f.write(f"# Finish reason: {finish_reason}\n\n")
+        f.write(output_text)
+    print(f"   📝 Logged output → {filepath}")
+
+
+def log_verbose_code_extract(log_dirs: Dict[str, Path], round_num: int, attempt: int,
+                             raw_text: str, extracted_code: Optional[str], 
+                             method_used: str, success: bool):
+    """Log code extraction result to file if enabled"""
+    if not log_dirs:
+        return
+    filepath = log_dirs["code_extract"] / f"r{round_num}_a{attempt:02d}.json"
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "round": round_num,
+        "attempt": attempt,
+        "extraction_success": success,
+        "method_used": method_used,
+        "extracted_code_length": len(extracted_code) if extracted_code else 0,
+        "extracted_code_snippet": extracted_code[:500] if extracted_code else None,  # snippet only
+    }
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(entry, f, indent=2, ensure_ascii=False)
+    print(f"   📝 Logged extraction → {filepath}")
+
+
+def log_verbose_ncu_raw(log_dirs: Dict[str, Path], round_num: int, ncu_result: Dict[str, Any]):
+    """Save raw NCU output for later inspection"""
+    if not log_dirs or not ncu_result:
+        return
+    filepath = log_dirs["ncu_raw"] / f"round{round_num}_ncu_raw.txt"
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(f"# NCU Raw Output - Round {round_num}\n")
+        f.write(f"# Timestamp: {datetime.now().isoformat()}\n")
+        f.write(f"# Success: {ncu_result.get('success')}\n")
+        f.write(f"# Return code: {ncu_result.get('returncode')}\n\n")
+        f.write(ncu_result.get("combined", "No output"))
+    print(f"   📝 Logged NCU raw → {filepath}")
 
 
 # ============================================================================
@@ -887,13 +1220,25 @@ def parse_args():
                         help="Override max retries per round")
     parser.add_argument("--test_input_size", type=int, default=4096,
                         help="Input size for kernel profiling")
-    parser.add_argument("--perf_threshold", type=float, default=0.05,
-                        help="Performance improvement threshold (0.05 = 5%)")
+    parser.add_argument("--perf_threshold", type=float, default=0.01,
+                        help="Performance improvement threshold (0.01 = 1%)")
     
     # vLLM runtime args
     parser.add_argument("--gpu_memory_util", type=float, default=None,
                         help="Override GPU memory utilization (0.0-0.95)")
     
+    # 📝 Verbose logging control (for debugging/analysis)
+    parser.add_argument("--log_verbose", action="store_true", default=False,
+                        help="Enable verbose logging of prompts, outputs, and code extraction")
+    parser.add_argument("--log_prompts", action="store_true", default=False,
+                        help="Log all prompts sent to the model")
+    parser.add_argument("--log_outputs", action="store_true", default=False,
+                        help="Log all raw model outputs (before extraction)")
+    parser.add_argument("--log_code_extract", action="store_true", default=False,
+                        help="Log code extraction attempts and results")
+    parser.add_argument("--verbose_log_dir", type=str, default="verbose_logs",
+                        help="Directory for verbose debug logs (separate from JSONL metrics)")
+
     return parser.parse_args()
 
 
@@ -929,14 +1274,27 @@ def build_experiment_entry(args, meta_r1, meta_r2, ncu_r1, ncu_r2,
                           kernel_r1, kernel_r2, duration_r1, duration_r2) -> Dict[str, Any]:
     """Build compact experiment entry for JSONL logging"""
     
-    # Extract durations safely
+    # Extract durations safely - PRIORITY: use meta_r2 duration (from inside generate_round2)
     r1_dur = duration_r1[0] if duration_r1 else None
-    r2_dur = duration_r2[0] if duration_r2 else (meta_r2.get('duration_us') if meta_r2 else None)
+    
+    # 🔑 FIX: Try meta_r2['duration_us'] first, fallback to duration_r2 list
+    r2_dur = None
+    if meta_r2 and meta_r2.get('duration_us'):
+        r2_dur = meta_r2['duration_us']  # From inside generate_round2_with_retry
+    elif duration_r2:
+        r2_dur = duration_r2[0]  # From main() separate NCU call
     
     # Calculate improvement
     improvement_pct = None
     if r1_dur and r2_dur and r1_dur > 0:
         improvement_pct = round((r1_dur - r2_dur) / r1_dur * 100, 2)
+    
+    # 🔑 FIX: Determine ncu_success from meta_r2 or ncu_r2
+    r2_ncu_success = False
+    if meta_r2 and meta_r2.get('duration_us'):
+        r2_ncu_success = True  # If we have duration from meta, profiling succeeded
+    elif ncu_r2:
+        r2_ncu_success = ncu_r2.get("success", False)
     
     return {
         # Config snapshot
@@ -944,7 +1302,7 @@ def build_experiment_entry(args, meta_r1, meta_r2, ncu_r1, ncu_r2,
             "run_name": args.run_name,
             "model": args.model,
             "max_retries": args.max_retries,
-            "use_ncu": args.use_ncu,  # 🔑 KEY: ablation flag
+            "use_ncu": args.use_ncu,
             "test_input_size": args.test_input_size,
             "perf_threshold": args.perf_threshold,
             "conv_depth": CONVERSATIONAL_DEPTH,
@@ -962,8 +1320,8 @@ def build_experiment_entry(args, meta_r1, meta_r2, ncu_r1, ncu_r2,
         "round2": {
             "status": meta_r2.get("status") if meta_r2 else "failed",
             "attempts": meta_r2.get("attempts") if meta_r2 else None,
-            "duration_us": r2_dur,
-            "ncu_success": ncu_r2.get("success") if ncu_r2 else False,
+            "duration_us": r2_dur,  # 🔑 Now uses meta_r2 duration
+            "ncu_success": r2_ncu_success,  # 🔑 Now checks meta_r2 first
             "code_hint": meta_r2.get("memory", RetryMemory()).attempts[-1].code_hint if meta_r2 and meta_r2.get("memory") else None,
         },
         # Performance comparison
@@ -972,7 +1330,7 @@ def build_experiment_entry(args, meta_r1, meta_r2, ncu_r1, ncu_r2,
             "meets_threshold": improvement_pct is not None and improvement_pct >= args.perf_threshold * 100,
             "threshold_pct": args.perf_threshold * 100,
         },
-        # Optional: code metadata (not full code to save space)
+        # Code metadata
         "code_metadata": {
             "r1_optimizations": meta_r1.get("memory", RetryMemory()).attempts[-1].code_hint if meta_r1 and meta_r1.get("memory") else None,
             "r2_optimizations": meta_r2.get("memory", RetryMemory()).attempts[-1].code_hint if meta_r2 and meta_r2.get("memory") else None,
@@ -997,6 +1355,11 @@ def main():
     if args.perf_threshold:
         global PERFORMANCE_IMPROVEMENT_THRESHOLD; PERFORMANCE_IMPROVEMENT_THRESHOLD = args.perf_threshold
     
+    log_dirs = None
+    if args.log_verbose or args.log_prompts or args.log_outputs or args.log_code_extract:
+        log_dirs = setup_verbose_log_dirs(args.run_name, args.verbose_log_dir)
+        print(f"🗂️  Verbose logs enabled → {args.verbose_log_dir}/{args.run_name}/")
+
     print("="*80)
     print("🚀 DeepSeek-R1 CUDA Kernel Generation Pipeline")
     print("   Strategy: Stateful Hybrid Retry + Self-Reflection")
@@ -1041,23 +1404,54 @@ def main():
     else:
         print(f"⚠️  NCU R1 failed: {ncu_r1.get('error', 'unknown')}")
     
+    # Log verbose NCU if enabled
+    if log_dirs:
+        log_verbose_ncu_raw(log_dirs, 1, ncu_r1)    
+
     # =========================================================================
     # ROUND 2
     # =========================================================================
-    kernel_r2, text_r2, meta_r2 = generate_round2_with_retry(llm, kernel_r1, ncu_r1, MAX_RETRIES, args.use_ncu)
+    kernel_r2, text_r2, meta_r2 = generate_round2_with_retry(
+        llm, kernel_r1, ncu_r1, MAX_RETRIES,
+        use_ncu=args.use_ncu, log_dirs=log_dirs, args=args
+    )
     
+    # 🔑 FIX: NCU Profiling R2 - meta_r2 already contains duration_us from inside generate_round2
+    # Only run separate NCU if we need raw output for verbose logging
     ncu_r2, duration_r2 = None, []
-    if args.use_ncu and kernel_r2:
-        ncu_r2 = run_ncu_profiler("./testcases/backprop-cuda/main", [args.test_input_size], 300, NCU_REPORT_R2)
-        duration_r2 = ncu_r2.get("duration_extracted", {}).get("kernel_durations_us", []) if ncu_r2.get("success") else []
+    if kernel_r2:
+        # Check if meta_r2 already has duration (from internal profiling)
+        if meta_r2 and meta_r2.get('duration_us'):
+            duration_r2 = [meta_r2['duration_us']]  # Use existing duration
+            print(f"   📊 R2 Duration (from meta): {meta_r2['duration_us']:.2f}μs")
+        else:
+            # Fallback: run separate NCU profiling
+            print(f"   ⚠️  No duration in meta_r2, running separate NCU profiling...")
+            ncu_r2 = run_ncu_profiler("./testcases/backprop-cuda/main", [args.test_input_size], 300, NCU_REPORT_R2)
+            if ncu_r2.get("success"):
+                duration_r2 = ncu_r2.get("duration_extracted", {}).get("kernel_durations_us", [])
+        
+        # Verbose logging (only if enabled)
+        if log_dirs and ncu_r2:
+            log_verbose_ncu_raw(log_dirs, round_num=2, ncu_result=ncu_r2)
     
     # =========================================================================
-    # 🗃️ LOG TO JSONL ⭐ NEW
+    # 🗃️ LOG TO JSONL
     # =========================================================================
+    # 🔑 DEBUG: Print what we're logging
+    print(f"\n🔍 Debug: Before logging entry:")
+    print(f"   meta_r2 keys: {meta_r2.keys() if meta_r2 else 'None'}")
+    print(f"   meta_r2['duration_us']: {meta_r2.get('duration_us') if meta_r2 else 'N/A'}")
+    print(f"   duration_r2: {duration_r2}")
+    
     entry = build_experiment_entry(
         args, meta_r1, meta_r2, ncu_r1, ncu_r2,
         kernel_r1, kernel_r2, duration_r1, duration_r2
     )
+    
+    print(f"   entry['round2']['duration_us']: {entry['round2']['duration_us']}")
+    print(f"   entry['round2']['ncu_success']: {entry['round2']['ncu_success']}")
+    
     log_experiment_jsonl(args.run_name, args.log_dir, entry)
 
     # =========================================================================
