@@ -11,8 +11,9 @@
 #   - Exponential backoff with jitter
 # ============================================================================
 
-import os, re, time, shutil, subprocess, json, random
+import os, re, time, shutil, subprocess, json, random, argparse
 from pathlib import Path
+from datetime import datetime
 from typing import Optional, Tuple, List, Dict, Any
 from dataclasses import dataclass, field
 from vllm import LLM, SamplingParams
@@ -719,13 +720,16 @@ def generate_round1_with_retry(llm: LLM, max_retries: int = MAX_RETRIES) -> Tupl
 # ============================================================================
 
 def generate_round2_with_retry(llm: LLM, naive_code: str, ncu_r1: Dict[str, Any],
-                                max_retries: int = MAX_RETRIES) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
+                                max_retries: int = MAX_RETRIES, use_ncu=True) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
     """Generate Round 2 optimized kernel with performance-based retry"""
     print(f"\n{'#'*80}")
     print(f"# ROUND 2: Optimized Implementation (Max Retries: {max_retries})")
     print(f"{'#'*80}")
     
-    ncu_report = format_ncu_report_for_prompt(ncu_r1) if ncu_r1.get("success") else "⚠️  NCU profiling failed"
+    if use_ncu and ncu_r1 and ncu_r1.get("success"):
+        ncu_report = format_ncu_report_for_prompt(ncu_r1)
+    else:
+        ncu_report = "⚠️ NCU profiling disabled - optimize based on general CUDA best practices"
     base_prompt = build_round2_prompt(naive_code, ncu_report)
     memory = RetryMemory(max_history=CONVERSATIONAL_DEPTH, round_num=2)
     self_critique = None
@@ -809,7 +813,7 @@ def generate_round2_with_retry(llm: LLM, naive_code: str, ncu_r1: Dict[str, Any]
             
             # Profile for performance check (if R1 has durations)
             duration_us = None
-            if r1_durs and attempt < max_retries:  # Don't profile on last attempt
+            if use_ncu and r1_durs and attempt < max_retries:  # Don't profile on last attempt
                 print(f"   🔬 Profiling for performance comparison...")
                 ncu_r2 = run_ncu_profiler("./testcases/backprop-cuda/main", [4096], 300, NCU_REPORT_R2)
                 
@@ -857,10 +861,142 @@ def generate_round2_with_retry(llm: LLM, naive_code: str, ncu_r1: Dict[str, Any]
 
 
 # ============================================================================
+# ⚙️ Argument Parser
+# ============================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="DeepSeek-R1 CUDA Kernel Generation with Ablation Support",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # 🔑 Experiment control
+    parser.add_argument("--run_name", type=str, required=True,
+                        help="Name for this experiment run (creates experiment_logs/{run_name}.jsonl)")
+    parser.add_argument("--log_dir", type=str, default="experiment_logs",
+                        help="Directory for JSONL experiment logs")
+    
+    # 🔬 NCU ablation control (KEY FEATURE)
+    parser.add_argument("--use_ncu", action="store_true", default=False,
+                        help="Enable NCU profiling feedback in Round 2 (default: disabled for baseline)")
+    
+    # Config overrides (optional)
+    parser.add_argument("--model", type=str, default=None,
+                        help="Override LLM model path")
+    parser.add_argument("--max_retries", type=int, default=None,
+                        help="Override max retries per round")
+    parser.add_argument("--test_input_size", type=int, default=4096,
+                        help="Input size for kernel profiling")
+    parser.add_argument("--perf_threshold", type=float, default=0.05,
+                        help="Performance improvement threshold (0.05 = 5%)")
+    
+    # vLLM runtime args
+    parser.add_argument("--gpu_memory_util", type=float, default=None,
+                        help="Override GPU memory utilization (0.0-0.95)")
+    
+    return parser.parse_args()
+
+
+# 🗃️ Experiment JSONL Logging (one JSON object per line)
+def ensure_log_dir(log_dir: str) -> str:
+    """Create log directory if not exists"""
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    return log_dir
+
+
+def log_experiment_jsonl(run_name: str, log_dir: str, experiment_entry: Dict[str, Any]):
+    """
+    Append experiment result to JSONL file.
+    Format: experiment_logs/{run_name}.jsonl
+    Each line = one complete JSON object (easy to stream/parse with jq -c)
+    """
+    log_dir = ensure_log_dir(log_dir)
+    jsonl_path = os.path.join(log_dir, f"{run_name}.jsonl")
+    
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        **experiment_entry  # flatten config + results
+    }
+    
+    # Append as single-line JSON (JSONL format)
+    with open(jsonl_path, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    
+    print(f"📝 Logged to JSONL: {jsonl_path}")
+
+
+def build_experiment_entry(args, meta_r1, meta_r2, ncu_r1, ncu_r2, 
+                          kernel_r1, kernel_r2, duration_r1, duration_r2) -> Dict[str, Any]:
+    """Build compact experiment entry for JSONL logging"""
+    
+    # Extract durations safely
+    r1_dur = duration_r1[0] if duration_r1 else None
+    r2_dur = duration_r2[0] if duration_r2 else (meta_r2.get('duration_us') if meta_r2 else None)
+    
+    # Calculate improvement
+    improvement_pct = None
+    if r1_dur and r2_dur and r1_dur > 0:
+        improvement_pct = round((r1_dur - r2_dur) / r1_dur * 100, 2)
+    
+    return {
+        # Config snapshot
+        "config": {
+            "run_name": args.run_name,
+            "model": args.model,
+            "max_retries": args.max_retries,
+            "use_ncu": args.use_ncu,  # 🔑 KEY: ablation flag
+            "test_input_size": args.test_input_size,
+            "perf_threshold": args.perf_threshold,
+            "conv_depth": CONVERSATIONAL_DEPTH,
+            "self_reflect_after": SELF_REFLECT_AFTER_ATTEMPT,
+        },
+        # Round 1 results
+        "round1": {
+            "status": meta_r1.get("status") if meta_r1 else "failed",
+            "attempts": meta_r1.get("attempts") if meta_r1 else None,
+            "duration_us": r1_dur,
+            "ncu_success": ncu_r1.get("success") if ncu_r1 else False,
+            "code_hint": meta_r1.get("memory", RetryMemory()).attempts[-1].code_hint if meta_r1 and meta_r1.get("memory") else None,
+        },
+        # Round 2 results
+        "round2": {
+            "status": meta_r2.get("status") if meta_r2 else "failed",
+            "attempts": meta_r2.get("attempts") if meta_r2 else None,
+            "duration_us": r2_dur,
+            "ncu_success": ncu_r2.get("success") if ncu_r2 else False,
+            "code_hint": meta_r2.get("memory", RetryMemory()).attempts[-1].code_hint if meta_r2 and meta_r2.get("memory") else None,
+        },
+        # Performance comparison
+        "performance": {
+            "improvement_pct": improvement_pct,
+            "meets_threshold": improvement_pct is not None and improvement_pct >= args.perf_threshold * 100,
+            "threshold_pct": args.perf_threshold * 100,
+        },
+        # Optional: code metadata (not full code to save space)
+        "code_metadata": {
+            "r1_optimizations": meta_r1.get("memory", RetryMemory()).attempts[-1].code_hint if meta_r1 and meta_r1.get("memory") else None,
+            "r2_optimizations": meta_r2.get("memory", RetryMemory()).attempts[-1].code_hint if meta_r2 and meta_r2.get("memory") else None,
+        }
+    }
+
+
+# ============================================================================
 # 🚀 Main Pipeline
 # ============================================================================
 
 def main():
+    args = parse_args()
+    
+    # Override configs from args (if provided)
+    if args.model:
+        global LLM_MODEL; LLM_MODEL = args.model
+    if args.max_retries:
+        global MAX_RETRIES; MAX_RETRIES = args.max_retries
+    if args.gpu_memory_util:
+        global LLM_GPU_MEMORY_UTIL; LLM_GPU_MEMORY_UTIL = args.gpu_memory_util
+    if args.perf_threshold:
+        global PERFORMANCE_IMPROVEMENT_THRESHOLD; PERFORMANCE_IMPROVEMENT_THRESHOLD = args.perf_threshold
+    
     print("="*80)
     print("🚀 DeepSeek-R1 CUDA Kernel Generation Pipeline")
     print("   Strategy: Stateful Hybrid Retry + Self-Reflection")
@@ -899,17 +1035,31 @@ def main():
     ncu_r1 = run_ncu_profiler("./testcases/backprop-cuda/main", [4096], 300, NCU_REPORT_R1)
     
     if ncu_r1.get("success"):
-        durs = ncu_r1.get("duration_extracted", {}).get("kernel_durations_us", [])
-        if durs:
-            print(f"📊 R1 Kernel Duration: {[f'{d:.2f}μs' for d in durs]}")
+        duration_r1 = ncu_r1.get("duration_extracted", {}).get("kernel_durations_us", []) if ncu_r1.get("success") else []
+        if duration_r1:
+            print(f"📊 R1 Kernel Duration: {[f'{d:.2f}μs' for d in duration_r1]}")
     else:
         print(f"⚠️  NCU R1 failed: {ncu_r1.get('error', 'unknown')}")
     
     # =========================================================================
     # ROUND 2
     # =========================================================================
-    kernel_r2, text_r2, meta_r2 = generate_round2_with_retry(llm, kernel_r1, ncu_r1, MAX_RETRIES)
+    kernel_r2, text_r2, meta_r2 = generate_round2_with_retry(llm, kernel_r1, ncu_r1, MAX_RETRIES, args.use_ncu)
     
+    ncu_r2, duration_r2 = None, []
+    if args.use_ncu and kernel_r2:
+        ncu_r2 = run_ncu_profiler("./testcases/backprop-cuda/main", [args.test_input_size], 300, NCU_REPORT_R2)
+        duration_r2 = ncu_r2.get("duration_extracted", {}).get("kernel_durations_us", []) if ncu_r2.get("success") else []
+    
+    # =========================================================================
+    # 🗃️ LOG TO JSONL ⭐ NEW
+    # =========================================================================
+    entry = build_experiment_entry(
+        args, meta_r1, meta_r2, ncu_r1, ncu_r2,
+        kernel_r1, kernel_r2, duration_r1, duration_r2
+    )
+    log_experiment_jsonl(args.run_name, args.log_dir, entry)
+
     # =========================================================================
     # FINAL SUMMARY
     # =========================================================================

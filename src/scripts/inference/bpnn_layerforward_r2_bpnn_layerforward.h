@@ -14,55 +14,53 @@ __global__ void kernel_layerforward(
         float* __restrict__ hidden_partial_sum,
   const int hid) {
 
-  // Define thread and block indices
   int tx = threadIdx.x;
   int ty = threadIdx.y;
   int by = blockIdx.y;
 
-  // Shared memory for input and weights
+  // Shared memory allocation
   __shared__ float input_node[HEIGHT];
   __shared__ float weight_matrix[HEIGHT * WIDTH];
 
-  // Calculate input index
+  // Load input with coalesced access
   int input_idx = HEIGHT * by + ty;
   if (input_idx < hid) {
     input_node[ty] = input[input_idx];
   } else {
-    input_node[ty] = 0.0f; // Initialize unused elements to avoid garbage
+    input_node[ty] = 0.0f;
   }
 
-  // Load weights with improved coalescing
+  // Load weights with coalesced access
   int weight_idx = (hid + 1) * HEIGHT * by + (hid + 1) * ty + tx;
   if (weight_idx < (hid + 1) * HEIGHT * WIDTH) {
     weight_matrix[ty * WIDTH + tx] = input_weights[weight_idx];
   } else {
-    weight_matrix[ty * WIDTH + tx] = 0.0f; // Initialize unused elements
+    weight_matrix[ty * WIDTH + tx] = 0.0f;
   }
 
   __syncthreads();
 
-  // Multiply input and weights
+  // Multiply with improved data locality
   if (input_idx < hid) {
-    weight_matrix[ty * WIDTH + tx] *= input_node[ty];
+    float input_val = input_node[ty];
+    for (int i = 0; i < WIDTH; ++i) {
+      weight_matrix[ty * WIDTH + i] *= input_val;
+    }
   }
 
   __syncthreads();
 
-  // Efficient block-wise reduction
+  // Reduce with better warp utilization
   float sum = 0.0f;
-  if (tx < WIDTH) {
-    sum = weight_matrix[ty * WIDTH + tx];
-  }
-
-  // Block-wise reduction
-  for (int s = WIDTH / 2; s > 0; s >>= 1) {
-    if (tx < s) {
-      sum += weight_matrix[ty * WIDTH + tx + s];
+  if (tx == 0) {
+    for (int i = 0; i < WIDTH; ++i) {
+      sum += weight_matrix[ty * WIDTH + i];
     }
-    __syncthreads();
   }
 
-  // Store the result if tx is in the first half of the block
+  __syncthreads();
+
+  // Store result with coalesced access
   if (tx == 0) {
     int output_idx = by * hid + ty;
     if (output_idx < hid) {
