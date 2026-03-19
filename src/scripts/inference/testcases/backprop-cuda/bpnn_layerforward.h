@@ -38,6 +38,11 @@ __global__ void kernel_layerforward(
     weight_matrix[ty * WIDTH + tx] = 0.0f;
   }
 
+  // Load Input
+  input_node[ty] = input[HEIGHT * by + ty + 1];
+  // Load Weights
+  weight_matrix[ty * WIDTH + tx] = input_weights[(hid + 1) * HEIGHT * by + (hid + 1) * ty + tx + 1 + (hid + 1)];
+  // Synchronize
   __syncthreads();
 
   // Multiply with improved data locality
@@ -67,6 +72,5 @@ __global__ void kernel_layerforward(
       hidden_partial_sum[output_idx] = sum;
     }
   }
-}
 
 #endif // BPNN_LAYERFORWARD_R2_BPNN_LAYERFORWARD_H

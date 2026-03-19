@@ -36,13 +36,13 @@ NCU_REPORT_R1 = os.path.join(BASE_DIR, "ncu_report_round1.txt")
 NCU_REPORT_R2 = os.path.join(BASE_DIR, "ncu_report_round2.txt")
 
 # Retry Configuration
-MAX_RETRIES = 3                    # 32B 模型更聰明，3 次通常足夠，節省時間 (原為 5)
+MAX_RETRIES = 5                    # 32B 模型更聰明，3 次通常足夠，節省時間 (原為 5)
 RETRY_DELAY_BASE = 2               
 RETRY_DELAY_JITTER = 0.2           
 
 # Strategy Configuration
 CONVERSATIONAL_DEPTH = 2           
-SELF_REFLECT_AFTER_ATTEMPT = 1     # 32B 模型第一次失敗後就能給出高質量反思 (原為 2)
+SELF_REFLECT_AFTER_ATTEMPT = 2     # 32B 模型第一次失敗後就能給出高質量反思 (原為 2)
 PERFORMANCE_IMPROVEMENT_THRESHOLD = 0.05  
 
 # LLM Configuration
