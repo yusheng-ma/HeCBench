@@ -8,54 +8,37 @@ __global__ void kernel_layerforward(
     float* __restrict__ hidden_partial_sum,
     const int hid)
 {
-    // Shared memory for input and weights, combined for better access
-    __shared__ float s_data[2 * BLOCK_SIZE][BLOCK_SIZE];
+    const int hid_size = hid;
+    const int input_size = hid_size;
 
-    // Block and thread indices
-    int blockIdx_x = blockIdx.x;
-    int threadIdx_x = threadIdx.x;
-    int threadIdx_y = threadIdx.y;
+    // Shared memory for input and weights
+    __shared__ float s_input[32];
+    __shared__ float s_weights[32];
 
-    // Initialize partial sum
+    int hid_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int in_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
     float sum = 0.0f;
 
-    // Load input and weights into shared memory with coalesced access
-    int input_idx = blockIdx_x * BLOCK_SIZE + threadIdx_x;
-    int weight_idx = hid * BLOCK_SIZE + threadIdx_y;
-
-    // Load input if within bounds
-    if (input_idx < hid) {
-        s_data[threadIdx_y][threadIdx_x] = input[input_idx];
-    } else {
-        s_data[threadIdx_y][threadIdx_x] = 0.0f;
+    // Load input and weights into shared memory
+    if (hid_idx < hid_size) {
+        s_input[threadIdx.x] = input[hid_idx];
     }
 
-    // Load weights if within bounds
-    if (weight_idx < hid * BLOCK_SIZE) {
-        s_data[threadIdx_y + BLOCK_SIZE][threadIdx_x] = input_weights[weight_idx];
-    } else {
-        s_data[threadIdx_y + BLOCK_SIZE][threadIdx_x] = 0.0f;
+    if (in_idx < input_size) {
+        s_weights[threadIdx.y] = input_weights[in_idx];
     }
 
-    // Synchronize to ensure shared memory is loaded
     __syncthreads();
 
-    // Perform matrix multiplication with unrolled loop for better ILP
-    for (int k = 0; k < BLOCK_SIZE; k += 8) {
-        // Unroll 8 iterations at a time
-        sum += s_data[threadIdx_y][k] * s_data[threadIdx_y + BLOCK_SIZE][threadIdx_x];
-        sum += s_data[threadIdx_y][k + 1] * s_data[threadIdx_y + BLOCK_SIZE][threadIdx_x + 1];
-        sum += s_data[threadIdx_y][k + 2] * s_data[threadIdx_y + BLOCK_SIZE][threadIdx_x + 2];
-        sum += s_data[threadIdx_y][k + 3] * s_data[threadIdx_y + BLOCK_SIZE][threadIdx_x + 3];
-        sum += s_data[threadIdx_y][k + 4] * s_data[threadIdx_y + BLOCK_SIZE][threadIdx_x + 4];
-        sum += s_data[threadIdx_y][k + 5] * s_data[threadIdx_y + BLOCK_SIZE][threadIdx_x + 5];
-        sum += s_data[threadIdx_y][k + 6] * s_data[threadIdx_y + BLOCK_SIZE][threadIdx_x + 6];
-        sum += s_data[threadIdx_y][k + 7] * s_data[threadIdx_y + BLOCK_SIZE][threadIdx_x + 7];
+    // Perform matrix multiplication via tree reduction
+    for (int k = 0; k < hid_size; k++) {
+        sum += s_input[k] * s_weights[k];
     }
 
-    // Write the result to global memory with coalesced access
-    if (threadIdx_x < hid) {
-        hidden_partial_sum[blockIdx_x * BLOCK_SIZE + threadIdx_x] = sum;
+    // Store the result
+    if (hid_idx < hid_size) {
+        hidden_partial_sum[hid_idx] = sum;
     }
 }
 #endif
